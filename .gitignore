@@ -1,0 +1,29 @@
+# Binaries
+/seestorm-ingest
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test
+*.test
+*.out
+coverage.txt
+
+# Env
+.env
+.env.local
+
+# Snapshots (generated)
+/snapshots/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

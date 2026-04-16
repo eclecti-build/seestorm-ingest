@@ -1,0 +1,12 @@
+app = "seestorm-ingest"
+primary_region = "ord"  # Chicago - closest to Wisconsin
+
+[build]
+
+[env]
+  POLL_INTERVAL = "30s"
+  SNAPSHOT_DIR = "/data/snapshots"
+
+[mounts]
+  source = "seestorm_data"
+  destination = "/data"
