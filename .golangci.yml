@@ -1,26 +1,41 @@
+version: "2"
 run:
-  timeout: 5m
   tests: true
-
 linters:
-  disable-all: true
+  default: none
   enable:
     - errcheck
+    - gocritic
     - govet
+    - ineffassign
+    - misspell
+    - revive
     - staticcheck
     - unused
-    - ineffassign
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - gocritic
+        path: _test\.go
+    paths:
+      - ent
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
     - gofmt
     - goimports
-    - gosimple
-    - revive
-    - gocritic
-    - misspell
-
-issues:
-  exclude-dirs:
-    - ent
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - gocritic
+  exclusions:
+    generated: lax
+    paths:
+      - ent
+      - third_party$
+      - builtin$
+      - examples$
