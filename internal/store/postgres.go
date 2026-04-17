@@ -100,16 +100,16 @@ func (s *Store) UpsertStormReport(ctx context.Context, report spc.StormReport) e
 
 // ActiveAlertGeoJSON represents a single alert for the snapshot
 type ActiveAlertGeoJSON struct {
-	NWSID       string            `json:"nws_id"`
-	EventType   string            `json:"event_type"`
-	Severity    string            `json:"severity"`
-	Headline    string            `json:"headline"`
-	Description string            `json:"description"`
-	AreaDesc    string            `json:"area_desc"`
-	Geometry    json.RawMessage   `json:"geometry"`
-	EffectiveAt time.Time         `json:"effective_at"`
-	ExpiresAt   time.Time         `json:"expires_at"`
-	StormMotion *nws.StormMotion  `json:"storm_motion,omitempty"`
+	NWSID       string           `json:"nws_id"`
+	EventType   string           `json:"event_type"`
+	Severity    string           `json:"severity"`
+	Headline    string           `json:"headline"`
+	Description string           `json:"description"`
+	AreaDesc    string           `json:"area_desc"`
+	Geometry    json.RawMessage  `json:"geometry"`
+	EffectiveAt time.Time        `json:"effective_at"`
+	ExpiresAt   time.Time        `json:"expires_at"`
+	StormMotion *nws.StormMotion `json:"storm_motion,omitempty"`
 }
 
 func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, error) {
