@@ -27,7 +27,7 @@ jobs:
         run: go vet ./...
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
           # Pinned to avoid CI breakage when new golangci-lint releases land.
           # Bump intentionally after verifying locally (`make lint`).
