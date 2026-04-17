@@ -190,6 +190,19 @@ func TestParseEventMotion_EmptyEventMotionArray(t *testing.T) {
 	}
 }
 
+// Empty-string / whitespace-only entries should be treated like absence,
+// not malformation. Otherwise the motionFailed counter gets polluted with
+// noise whenever NWS (or an upstream stub) publishes a blank entry.
+func TestParseEventMotion_EmptyStringEntry(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{"", "   ", "\t", "\n\n"} {
+		got, err := ParseEventMotion(motionParams(raw))
+		if got != nil || err != nil {
+			t.Errorf("input %q: expected (nil, nil), got (%+v, %v)", raw, got, err)
+		}
+	}
+}
+
 func TestParseEventMotion_MalformedEntry(t *testing.T) {
 	t.Parallel()
 	got, err := ParseEventMotion(motionParams("garbage"))

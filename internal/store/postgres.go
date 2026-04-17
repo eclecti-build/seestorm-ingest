@@ -193,6 +193,14 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 		a.WarningTags = tags
 		alerts = append(alerts, a)
 	}
+	// pgx's rows.Next() returns false on both clean iteration end AND a
+	// mid-cursor error (network drop, server abort, etc.). Without this
+	// check a partial failure would silently publish a truncated alert
+	// snapshot — unacceptable for a public-safety feed where dropping a
+	// tornado warning could put people at risk.
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading active alerts: %w", err)
+	}
 
 	slog.InfoContext(ctx, "snapshot motion stats",
 		"parsed", motionParsed,

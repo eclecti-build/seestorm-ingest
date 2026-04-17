@@ -90,6 +90,12 @@ func ParseEventMotion(params map[string][]string) (*StormMotion, error) {
 		return nil, nil
 	}
 	raw := entries[0]
+	// An empty or whitespace-only entry is functionally the same as an
+	// absent one — treat it as "no motion" rather than a parse failure so
+	// it doesn't pollute the motionFailed counter with spurious noise.
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
 
 	m := motionRe.FindStringSubmatch(raw)
 	if m == nil {
