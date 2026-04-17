@@ -25,9 +25,11 @@
 // ParseEventMotion distinguishes three outcomes via its (motion, error)
 // signature:
 //
-//   - (nil, nil)  — parameters map is nil/empty or lacks eventMotionDescription.
-//   - (nil, err)  — entry present but malformed; err wraps the specific reason.
-//     Callers should log this so NWS format drift surfaces.
+//   - (nil, nil)  — parameters map is nil/empty, lacks eventMotionDescription,
+//     or the first entry is a blank / whitespace-only string. Absence and
+//     blankness are treated the same: alerts without a motion vector.
+//   - (nil, err)  — entry present and non-blank but malformed; err wraps the
+//     specific reason. Callers should log this so NWS format drift surfaces.
 //   - (motion, nil) — parsed successfully.
 package nws
 
@@ -72,11 +74,13 @@ var pairRe = regexp.MustCompile(`^(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)$`)
 // `parameters["eventMotionDescription"]` and converts it to a StormMotion.
 //
 // Return semantics:
-//   - (nil, nil)  — params is nil, empty, or lacks eventMotionDescription.
-//     This is expected for alerts without a motion vector (watches, flood
-//     statements, etc.) and is not an error.
-//   - (nil, err)  — entry was present but malformed (regex miss, bad coord
-//     pair, out-of-range direction/lat/lon). Caller should log this.
+//   - (nil, nil)  — params is nil, empty, lacks eventMotionDescription, or
+//     the first entry is blank / whitespace-only. All treated as "no motion"
+//     (watches, flood statements, or NWS publishing an empty value) and not
+//     an error — blank entries don't inflate the motionFailed counter.
+//   - (nil, err)  — entry was present and non-blank but malformed (regex
+//     miss, bad coord pair, out-of-range direction/lat/lon). Caller should
+//     log this so NWS format drift surfaces.
 //   - (motion, nil) — success. A timestamp that fails both RFC3339 parse
 //     attempts does NOT fail the whole parse: ValidAt falls back to
 //     time.Now().UTC() and a slog.Warn is emitted. Coordinates are the
