@@ -22,10 +22,18 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
+	if err := run(); err != nil {
+		slog.Error("fatal", "error", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("shutdown complete")
+}
+
+func run() error {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		slog.Error("DATABASE_URL is required")
-		os.Exit(1)
+		return fmt.Errorf("DATABASE_URL is required")
 	}
 
 	snapshotDir := os.Getenv("SNAPSHOT_DIR")
@@ -46,14 +54,12 @@ func main() {
 
 	db, err := store.New(ctx, dbURL)
 	if err != nil {
-		slog.Error("failed to connect to database", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("connect db: %w", err)
 	}
 	defer db.Close()
 
 	if err := db.Migrate(ctx); err != nil {
-		slog.Error("failed to run migrations", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("run migrations: %w", err)
 	}
 
 	nwsClient := nws.NewClient("(seestorm.org, contact@seestorm.org)")
@@ -75,9 +81,8 @@ func main() {
 	)
 
 	if err := p.Run(ctx); err != nil {
-		slog.Error("poller exited with error", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("poller: %w", err)
 	}
 
-	fmt.Println("shutdown complete")
+	return nil
 }
