@@ -29,7 +29,9 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
+          # Pinned to avoid CI breakage when new golangci-lint releases land.
+          # Bump intentionally after verifying locally (`make lint`).
+          version: v1.64.0
 
       - name: Test (race + coverage)
         run: go test -race -coverprofile=coverage.out ./...

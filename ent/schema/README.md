@@ -17,6 +17,16 @@ Reference: https://entgo.io/docs/schema-def
 4. Review the generated SQL and commit it alongside the schema change.
 5. `make migrate-apply` runs at deploy time against `DATABASE_URL`.
 
+## Prerequisites for `make migrate-diff`
+
+Atlas spins up an ephemeral Postgres container to compute the schema diff.
+You must have **Docker** running locally (see `dev = "docker://postgres/16/dev"`
+in `atlas.hcl`). If Docker isn't available, either install it, swap the Atlas
+`dev` URL to a persistent local Postgres, or run migrations only in CI/deploy.
+
+Additionally set `ATLAS_LOCAL_URL` in your `.env` before running
+`make migrate-diff` — see `.env.example` for the format.
+
 ## Current state
 
 This directory is intentionally empty — no entities are defined yet. Running
