@@ -58,9 +58,14 @@ func NewR2(ctx context.Context, cfg R2Config) (*R2, error) {
 	return &R2{client: client, bucket: cfg.Bucket}, nil
 }
 
-// Publish uploads the snapshot JSON to R2 at the canonical SnapshotKey.
-// ContentType and CacheControl are set on the object metadata, though the
-// Worker proxy ultimately controls the cache headers browsers see.
+// Publish writes the snapshot to R2 twice: the canonical live key (overwritten
+// every cycle, short cache) and a versioned history key (append-only, immutable,
+// long cache). The Worker serves `/v1/active-events.json` from the first and
+// `/v1/history/{ts}` from the second, enabling client-side scrubbing.
+//
+// Keys are alphabetically sortable thanks to the compact RFC3339-like format
+// `history/YYYYMMDDTHHMMSSZ.json`, which matters because R2's list API returns
+// objects in ascending lexicographic order.
 func (p *R2) Publish(ctx context.Context, snapshot Snapshot) error {
 	start := time.Now()
 
@@ -69,21 +74,40 @@ func (p *R2) Publish(ctx context.Context, snapshot Snapshot) error {
 		return fmt.Errorf("marshaling snapshot: %w", err)
 	}
 
-	_, err = p.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:       aws.String(p.bucket),
-		Key:          aws.String(SnapshotKey),
-		Body:         bytes.NewReader(data),
-		ContentType:  aws.String("application/json; charset=utf-8"),
-		CacheControl: aws.String("public, max-age=10, s-maxage=10"),
-	})
-	if err != nil {
-		return fmt.Errorf("r2 put %s/%s: %w", p.bucket, SnapshotKey, err)
+	historyKey := fmt.Sprintf(
+		"history/%s.json",
+		snapshot.GeneratedAt.UTC().Format("20060102T150405Z"),
+	)
+
+	targets := []struct {
+		key          string
+		cacheControl string
+	}{
+		// Live snapshot — short cache so edge absorbs burst load but clients
+		// see fresh data within one poll interval.
+		{SnapshotKey, "public, max-age=10, s-maxage=10"},
+		// Historical snapshot — immutable once written, cache for a year.
+		{historyKey, "public, max-age=31536000, immutable"},
+	}
+
+	for _, t := range targets {
+		_, err := p.client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:       aws.String(p.bucket),
+			Key:          aws.String(t.key),
+			Body:         bytes.NewReader(data),
+			ContentType:  aws.String("application/json; charset=utf-8"),
+			CacheControl: aws.String(t.cacheControl),
+		})
+		if err != nil {
+			return fmt.Errorf("r2 put %s/%s: %w", p.bucket, t.key, err)
+		}
 	}
 
 	slog.InfoContext(ctx, "snapshot published",
 		"destination", "r2",
 		"bucket", p.bucket,
-		"key", SnapshotKey,
+		"current_key", SnapshotKey,
+		"history_key", historyKey,
 		"size_bytes", len(data),
 		"alert_count", snapshot.AlertCount,
 		"duration", time.Since(start),
