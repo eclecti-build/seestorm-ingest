@@ -130,10 +130,16 @@ func run() error {
 
 // parseAreas turns a raw NWS_AREA env value into the slice of state codes
 // passed to the poller. Tokens are trimmed, uppercased, validated against
-// the USPS 2-letter pattern, and de-duplicated. Invalid tokens are logged
-// and skipped rather than failing startup so a single typo doesn't take
-// down the whole service. Empty / unset input falls back to ["WI"] to
-// preserve the historical single-state default.
+// both the USPS 2-letter pattern AND the actual NWS state/territory
+// allowlist, and de-duplicated. Invalid tokens are logged and skipped
+// rather than failing startup so a single typo doesn't take down the whole
+// service. Empty / unset input falls back to ["WI"] to preserve the
+// historical single-state default.
+//
+// Validating against the allowlist (not just the regex) prevents a typo
+// like `ZZ` or `XX` from passing through to api.weather.gov — those would
+// match the regex shape but return zero alerts and silently drop coverage
+// for whatever state the user meant.
 func parseAreas(raw string) []string {
 	if strings.TrimSpace(raw) == "" {
 		return []string{"WI"}
@@ -142,7 +148,7 @@ func parseAreas(raw string) []string {
 	out := make([]string, 0, 8)
 	for _, token := range strings.Split(raw, ",") {
 		code := strings.ToUpper(strings.TrimSpace(token))
-		if !stateCodeRE.MatchString(code) {
+		if !stateCodeRE.MatchString(code) || !nws.IsValidStateCode(code) {
 			slog.Warn("ignoring invalid NWS_AREA token", "token", token)
 			continue
 		}

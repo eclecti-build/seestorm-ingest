@@ -1,7 +1,9 @@
 package store
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -55,10 +57,13 @@ func TestDeriveStates(t *testing.T) {
 			wantUsedFallback: true,
 		},
 		{
-			name:             "no_data_returns_nil",
+			// Wire-format contract: callers serialize states[] with no
+			// `omitempty`, so an empty result MUST be `[]string{}` (marshals
+			// to `[]`), not nil (marshals to `null`).
+			name:             "no_data_returns_empty_slice_not_nil",
 			sameCodes:        nil,
 			areaDesc:         "",
-			wantStates:       nil,
+			wantStates:       []string{},
 			wantUsedFallback: false,
 		},
 	}
@@ -74,5 +79,30 @@ func TestDeriveStates(t *testing.T) {
 				t.Errorf("usedFallback: got %v want %v", gotFallback, tc.wantUsedFallback)
 			}
 		})
+	}
+}
+
+// TestActiveAlertGeoJSON_StatesSerializesAsArrayWhenEmpty guards the v2 wire
+// contract: `states[]` has no `omitempty`, so a nil slice would marshal to
+// `null` and break the client (which expects an array). An empty derivation
+// result must serialize to `[]`.
+func TestActiveAlertGeoJSON_StatesSerializesAsArrayWhenEmpty(t *testing.T) {
+	t.Parallel()
+
+	states, _ := deriveStates(nil, "")
+	a := ActiveAlertGeoJSON{
+		NWSID:     "urn:oid:test.empty",
+		EventType: "Test",
+		States:    states,
+	}
+	raw, err := json.Marshal(a)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"states":[]`) {
+		t.Fatalf("expected `states:[]` in JSON, got: %s", raw)
+	}
+	if strings.Contains(string(raw), `"states":null`) {
+		t.Fatalf("states must not serialize to null, got: %s", raw)
 	}
 }

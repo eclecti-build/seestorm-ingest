@@ -21,6 +21,27 @@ var fipsStateCodes = map[string]string{
 	"60": "AS", "66": "GU", "69": "MP", "72": "PR", "78": "VI",
 }
 
+// validStateAbbrevs is the set of USPS 2-letter state codes (and territory
+// codes) used by NWS. Built once from fipsStateCodes so it can never drift
+// from the FIPS table.
+var validStateAbbrevs = func() map[string]struct{} {
+	out := make(map[string]struct{}, len(fipsStateCodes))
+	for _, abbrev := range fipsStateCodes {
+		out[abbrev] = struct{}{}
+	}
+	return out
+}()
+
+// IsValidStateCode reports whether the given string is a USPS state (or
+// territory) abbreviation recognized by NWS. Used by ingest to validate
+// the NWS_AREA env var before sending it upstream — a typo like `ZZ` matches
+// the regex shape but isn't a real state and would make the api.weather.gov
+// request silently meaningless.
+func IsValidStateCode(code string) bool {
+	_, ok := validStateAbbrevs[code]
+	return ok
+}
+
 // StateForSAMECode resolves a 6-digit NWS SAME code (e.g. "055025") to a
 // 2-letter state abbreviation. SAME codes are formatted PSSCCC where:
 //

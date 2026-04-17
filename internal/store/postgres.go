@@ -125,14 +125,12 @@ type ActiveAlertGeoJSON struct {
 
 // alertPropsParams is the minimal shape we unmarshal out of the JSONB
 // `properties` column. We surface `parameters` for motion parsing and
-// `geocode.SAME` for state derivation. Decoding the full AlertProperties
-// here is wasteful — we only need these two slices.
+// `geocode` for state derivation. Decoding the full AlertProperties
+// here is wasteful — we only need these two fields. We share `nws.AlertGeocode`
+// with the upstream marshaler so the wire shape can't silently drift.
 type alertPropsParams struct {
 	Parameters map[string][]string `json:"parameters"`
-	Geocode    struct {
-		SAME []string `json:"SAME"`
-		UGC  []string `json:"UGC"`
-	} `json:"geocode"`
+	Geocode    nws.AlertGeocode    `json:"geocode"`
 }
 
 func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, error) {
@@ -273,7 +271,7 @@ func deriveStates(sameCodes []string, areaDesc string) ([]string, bool) {
 					upper := strings.ToUpper(candidate)
 					// Only accept if the abbreviation is a known state code.
 					// Guards against "NEAR THE LAKE, ETC" garbage.
-					if _, ok := fipsToStateAbbrevSet[upper]; ok {
+					if nws.IsValidStateCode(upper) {
 						seen[upper] = struct{}{}
 					}
 				}
@@ -281,10 +279,10 @@ func deriveStates(sameCodes []string, areaDesc string) ([]string, bool) {
 		}
 	}
 
-	if len(seen) == 0 {
-		return nil, usedFallback
-	}
-
+	// Always return a non-nil slice so the wire shape is uniform.
+	// `States []string` has no `omitempty` and Go marshals nil slices as
+	// `null` — that breaks the v2 contract (`states[]` is documented as an
+	// array). Empty alerts therefore must serialize to `[]`, not `null`.
 	out := make([]string, 0, len(seen))
 	for s := range seen {
 		out = append(out, s)
@@ -292,24 +290,3 @@ func deriveStates(sameCodes []string, areaDesc string) ([]string, bool) {
 	sort.Strings(out)
 	return out, usedFallback
 }
-
-// fipsToStateAbbrevSet is the set of valid USPS state abbreviations used to
-// validate area_desc fallback parsing. Built once from the nws FIPS table.
-var fipsToStateAbbrevSet = func() map[string]struct{} {
-	// Hardcoded list mirrors the values in nws.fipsStateCodes. Kept here as
-	// a private set rather than exporting from nws to avoid a circular
-	// dependency or a public API that would have to be kept in sync.
-	abbrevs := []string{
-		"AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL",
-		"GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME",
-		"MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH",
-		"NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI",
-		"SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI",
-		"WY", "AS", "GU", "MP", "PR", "VI",
-	}
-	set := make(map[string]struct{}, len(abbrevs))
-	for _, a := range abbrevs {
-		set[a] = struct{}{}
-	}
-	return set
-}()
