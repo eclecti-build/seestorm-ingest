@@ -111,6 +111,7 @@ type ActiveAlertGeoJSON struct {
 	EffectiveAt time.Time        `json:"effective_at"`
 	ExpiresAt   time.Time        `json:"expires_at"`
 	StormMotion *nws.StormMotion `json:"storm_motion,omitempty"`
+	WarningTags *nws.WarningTags `json:"warning_tags,omitempty"`
 }
 
 func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, error) {
@@ -142,6 +143,19 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 			)
 		}
 		a.StormMotion = motion
+
+		// Parse IBW warning tags for Tornado / Severe Thunderstorm /
+		// Flash Flood warnings. Watches + statements lack the `&&`
+		// block, so ParseWarningTags returns (nil, nil) for them and
+		// the omitempty JSON tag keeps the snapshot small.
+		tags, err := nws.ParseWarningTags(a.Description)
+		if err != nil {
+			slog.WarnContext(ctx, "warning tag parse failed",
+				"nws_id", a.NWSID,
+				"error", err,
+			)
+		}
+		a.WarningTags = tags
 		alerts = append(alerts, a)
 	}
 
