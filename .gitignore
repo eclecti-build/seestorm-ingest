@@ -1,5 +1,6 @@
 # Binaries
 /seestorm-ingest
+/bin/
 *.exe
 *.exe~
 *.dll
@@ -27,3 +28,9 @@ coverage.txt
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code local state
+.claude/
+
+# Codex review artifacts
+.codex-review/
