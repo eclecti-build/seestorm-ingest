@@ -9,7 +9,7 @@ Agent-facing summary of SeeStorm Ingest conventions. For the full context, read 
 
 ## Layout
 - `cmd/ingest/` entry point
-- `internal/{nws,spc,store,publisher,poller,auth}/`
+- `internal/{nws,spc,store,publisher,poller}/`
 - `ent/schema/` Ent entities (add one file per entity)
 - `ent/migrate/migrations/` Atlas SQL
 - `migrations/001_initial.sql` legacy baseline — do not edit
@@ -35,7 +35,7 @@ Agent-facing summary of SeeStorm Ingest conventions. For the full context, read 
 - Generated code in `ent/` is excluded from lint
 
 ## Auth
-Clerk JWT verifier stub at `internal/auth/clerk.go`. Returns `ErrNotImplemented`. Do not wire into handlers without an accompanying architectural decision.
+None. Ingest output is public (Cloudflare R2 snapshots). Future auth is scoped to specific opt-in features (spotter reports, admin) — see umbrella `docs/FUTURE.md`.
 
 ## Deploy
 Fly.io via `make fly-deploy` (wraps `flyctl deploy --remote-only`). CI deploy on push to `main` uses `FLY_API_TOKEN`.

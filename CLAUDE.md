@@ -26,7 +26,6 @@ See `Makefile` for the full target list.
 - `internal/store/` — PostGIS storage layer (pgx/v5 today; Ent-generated client landing alongside)
 - `internal/publisher/` — JSON snapshot publisher (local + R2)
 - `internal/poller/` — polling orchestrator
-- `internal/auth/` — Clerk JWT verification (stub, not yet wired)
 - `ent/schema/` — Ent entity schema (empty — add `.go` files as entities are introduced)
 - `ent/migrate/migrations/` — Atlas-managed migration SQL
 
@@ -37,8 +36,9 @@ See `Makefile` for the full target list.
 4. Publish `active-events.json` snapshot to local disk and Cloudflare R2
 
 ## Auth
-Clerk JWT verification via `github.com/clerk/clerk-sdk-go/v2`.
-Stub lives at `internal/auth/clerk.go` and returns `ErrNotImplemented`. It is **not** wired into any handler yet — enable once `/api` routes require auth. Set `CLERK_SECRET_KEY` in the environment when wiring.
+**None.** The ingest service exposes no authenticated endpoints today — its output (snapshot JSON on Cloudflare R2) is public by design. Public safety data stays frictionless.
+
+Future work may require auth for narrow use cases (user-submitted spotter reports, admin-only data corrections, rate-limiting abusive scrapers). Evaluate at the edge (Cloudflare WAF) before adding application-level auth. See `../seestorm/docs/FUTURE.md`.
 
 ## Testing
 - Standard Go `*_test.go` files, table-driven
@@ -82,4 +82,5 @@ Required env for Atlas:
 - `DATABASE_URL` — prod Postgres URL (for `migrate-apply`)
 
 ## Companion Repos
-- Frontend: `eclecti-build/seestorm`
+- Umbrella: `eclecti-build/seestorm`
+- Frontend: `eclecti-build/seestorm-client`
