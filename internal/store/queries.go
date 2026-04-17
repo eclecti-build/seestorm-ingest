@@ -80,7 +80,7 @@ const activeAlertsSQL = `
 SELECT
     nws_id, event_type, severity, headline, description,
     area_desc, ST_AsGeoJSON(geometry) as geometry,
-    effective_at, expires_at
+    effective_at, expires_at, properties
 FROM weather_events
 WHERE expires_at > NOW()
 ORDER BY effective_at DESC

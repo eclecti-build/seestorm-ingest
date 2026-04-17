@@ -32,4 +32,9 @@ type AlertProperties struct {
 	MessageType string `json:"messageType"`
 	Category    string `json:"category"`
 	Response    string `json:"response"`
+	// Parameters carries the NWS `properties.parameters` map. Motion is
+	// published here as `eventMotionDescription` (a single-element string
+	// slice), which supersedes the legacy TIME...MOT...LOC block that
+	// api.weather.gov no longer emits in `description`.
+	Parameters map[string][]string `json:"parameters"`
 }

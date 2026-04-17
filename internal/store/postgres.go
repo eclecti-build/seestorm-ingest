@@ -114,6 +114,13 @@ type ActiveAlertGeoJSON struct {
 	WarningTags *nws.WarningTags `json:"warning_tags,omitempty"`
 }
 
+// alertPropsParams is the minimal shape we unmarshal out of the JSONB
+// `properties` column to surface `parameters` for motion parsing. Decoding
+// the full AlertProperties here is wasteful — we only need `parameters`.
+type alertPropsParams struct {
+	Parameters map[string][]string `json:"parameters"`
+}
+
 func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, error) {
 	rows, err := s.pool.Query(ctx, activeAlertsSQL)
 	if err != nil {
@@ -121,13 +128,19 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 	}
 	defer rows.Close()
 
-	var alerts []ActiveAlertGeoJSON
+	var (
+		alerts       []ActiveAlertGeoJSON
+		motionParsed int
+		motionAbsent int
+		motionFailed int
+	)
 	for rows.Next() {
 		var a ActiveAlertGeoJSON
 		var geomStr *string
+		var propsJSON []byte
 		err := rows.Scan(
 			&a.NWSID, &a.EventType, &a.Severity, &a.Headline, &a.Description,
-			&a.AreaDesc, &geomStr, &a.EffectiveAt, &a.ExpiresAt,
+			&a.AreaDesc, &geomStr, &a.EffectiveAt, &a.ExpiresAt, &propsJSON,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning alert row: %w", err)
@@ -135,13 +148,35 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 		if geomStr != nil {
 			a.Geometry = json.RawMessage(*geomStr)
 		}
-		motion, err := nws.ParseStormMotion(a.Description, a.EffectiveAt)
-		if err != nil {
+
+		// Pull only `parameters` out of the JSONB — that's all the
+		// motion parser needs. A malformed JSONB row shouldn't drop
+		// the alert; log and proceed with a zero map.
+		var props alertPropsParams
+		if len(propsJSON) > 0 {
+			if err := json.Unmarshal(propsJSON, &props); err != nil {
+				slog.WarnContext(ctx, "alert properties JSONB decode failed",
+					"nws_id", a.NWSID,
+					"error", err,
+				)
+			}
+		}
+
+		motion, err := nws.ParseEventMotion(props.Parameters)
+		switch {
+		case err != nil:
+			motionFailed++
 			slog.WarnContext(ctx, "storm motion parse failed",
 				"nws_id", a.NWSID,
 				"error", err,
 			)
+		case motion == nil:
+			motionAbsent++
+		default:
+			motionParsed++
 		}
+		// Motion is optional — the alert stays in the snapshot whether
+		// or not we got a vector.
 		a.StormMotion = motion
 
 		// Parse IBW warning tags for Tornado / Severe Thunderstorm /
@@ -158,6 +193,12 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 		a.WarningTags = tags
 		alerts = append(alerts, a)
 	}
+
+	slog.InfoContext(ctx, "snapshot motion stats",
+		"parsed", motionParsed,
+		"absent", motionAbsent,
+		"failed", motionFailed,
+	)
 
 	return alerts, nil
 }
