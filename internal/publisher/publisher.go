@@ -15,12 +15,22 @@ import (
 // Changing it is a breaking change for the public Worker allowlist.
 const SnapshotKey = "active-events.json"
 
+// SnapshotSchemaVersion is the wire-format version published in every snapshot.
+// Bump this when the Snapshot or ActiveAlertGeoJSON shape changes in a way the
+// client must adapt to. The client should refuse to render an unrecognized
+// version rather than silently mis-render.
+//
+// v2 (2026-04): replaced top-level `area string` with `areas []string` and
+// added per-alert `states []string` to support multi-state ingest.
+const SnapshotSchemaVersion = 2
+
 // Snapshot is the CDN-cacheable JSON published after each poll cycle.
 type Snapshot struct {
-	GeneratedAt time.Time                  `json:"generated_at"`
-	Area        string                     `json:"area"`
-	AlertCount  int                        `json:"alert_count"`
-	Alerts      []store.ActiveAlertGeoJSON `json:"alerts"`
+	SchemaVersion int                        `json:"schema_version"`
+	GeneratedAt   time.Time                  `json:"generated_at"`
+	Areas         []string                   `json:"areas"`
+	AlertCount    int                        `json:"alert_count"`
+	Alerts        []store.ActiveAlertGeoJSON `json:"alerts"`
 }
 
 // Publisher writes a Snapshot somewhere durable and reachable.

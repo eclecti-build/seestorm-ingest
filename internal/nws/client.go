@@ -19,14 +19,20 @@ type Client struct {
 func NewClient(userAgent string) *Client {
 	return &Client{
 		httpClient: &http.Client{
-			Timeout: 15 * time.Second,
+			// 30s accommodates outbreak-day payloads when polling many states
+			// in a single request (e.g. an 8-state Great Lakes pull during a
+			// multi-state derecho can return several MB of GeoJSON).
+			Timeout: 30 * time.Second,
 		},
 		userAgent: userAgent,
 		baseURL:   "https://api.weather.gov",
 	}
 }
 
-// FetchActiveAlerts retrieves active alerts for the given area (e.g., "WI")
+// FetchActiveAlerts retrieves active alerts for the given area. The api.weather.gov
+// `area` parameter accepts either a single state code (e.g. "WI") or a
+// comma-separated list (e.g. "MN,WI,IL,IN,MI,OH,PA,NY"); the API returns a
+// single merged FeatureCollection so multi-state polling is one HTTP call.
 func (c *Client) FetchActiveAlerts(ctx context.Context, area string) (*AlertsResponse, error) {
 	params := url.Values{
 		"area":   {area},

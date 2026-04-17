@@ -3,6 +3,7 @@ package poller
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/eclecti-build/seestorm-ingest/internal/nws"
@@ -17,7 +18,10 @@ type Config struct {
 	Store        *store.Store
 	Publisher    publisher.Publisher
 	PollInterval time.Duration
-	Area         string
+	// Areas is the set of US state codes to poll. The NWS API accepts a
+	// comma-separated list as a single `?area=` query, so multi-state
+	// polling stays one HTTP request regardless of slice length.
+	Areas []string
 }
 
 type Poller struct {
@@ -88,7 +92,9 @@ func (p *Poller) poll(ctx context.Context) {
 }
 
 func (p *Poller) pollAlerts(ctx context.Context) int {
-	alerts, err := p.cfg.NWS.FetchActiveAlerts(ctx, p.cfg.Area)
+	// NWS supports a comma-separated `area` value natively, so multi-state
+	// polling is one request rather than N. See nws.FetchActiveAlerts docs.
+	alerts, err := p.cfg.NWS.FetchActiveAlerts(ctx, strings.Join(p.cfg.Areas, ","))
 	if err != nil {
 		slog.Error("failed to fetch alerts", "error", err)
 		return 0
@@ -151,10 +157,11 @@ func (p *Poller) publishSnapshot(ctx context.Context) {
 	}
 
 	snapshot := publisher.Snapshot{
-		GeneratedAt: time.Now().UTC(),
-		Area:        p.cfg.Area,
-		AlertCount:  len(alerts),
-		Alerts:      alerts,
+		SchemaVersion: publisher.SnapshotSchemaVersion,
+		GeneratedAt:   time.Now().UTC(),
+		Areas:         p.cfg.Areas,
+		AlertCount:    len(alerts),
+		Alerts:        alerts,
 	}
 
 	if err := p.cfg.Publisher.Publish(ctx, snapshot); err != nil {
