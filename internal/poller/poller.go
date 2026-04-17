@@ -15,7 +15,7 @@ type Config struct {
 	NWS          *nws.Client
 	SPC          *spc.Client
 	Store        *store.Store
-	Publisher    *publisher.FilePublisher
+	Publisher    publisher.Publisher
 	PollInterval time.Duration
 	Area         string
 }
@@ -124,11 +124,18 @@ func (p *Poller) pollStormReports(ctx context.Context) int {
 func (p *Poller) publishSnapshot(ctx context.Context) {
 	alerts, err := p.cfg.Store.GetActiveAlerts(ctx)
 	if err != nil {
-		slog.Error("failed to get active alerts for snapshot", "error", err)
+		slog.ErrorContext(ctx, "failed to get active alerts for snapshot", "error", err)
 		return
 	}
 
-	if err := p.cfg.Publisher.Publish(p.cfg.Area, alerts); err != nil {
-		slog.Error("failed to publish snapshot", "error", err)
+	snapshot := publisher.Snapshot{
+		GeneratedAt: time.Now().UTC(),
+		Area:        p.cfg.Area,
+		AlertCount:  len(alerts),
+		Alerts:      alerts,
+	}
+
+	if err := p.cfg.Publisher.Publish(ctx, snapshot); err != nil {
+		slog.ErrorContext(ctx, "failed to publish snapshot", "error", err)
 	}
 }

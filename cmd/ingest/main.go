@@ -41,6 +41,16 @@ func run() error {
 		snapshotDir = "./snapshots"
 	}
 
+	nwsUserAgent := os.Getenv("NWS_USER_AGENT")
+	if nwsUserAgent == "" {
+		nwsUserAgent = "(seestorm.org, contact@seestorm.org)"
+	}
+
+	area := os.Getenv("NWS_AREA")
+	if area == "" {
+		area = "WI"
+	}
+
 	pollInterval := 30 * time.Second
 	if v := os.Getenv("POLL_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -62,9 +72,31 @@ func run() error {
 		return fmt.Errorf("run migrations: %w", err)
 	}
 
-	nwsClient := nws.NewClient("(seestorm.org, contact@seestorm.org)")
+	// Publishers are composed so file + R2 fan out in parallel.
+	// File always runs (useful for on-Fly debugging via ssh console).
+	// R2 runs when all four R2_* env vars are present — in local dev, leaving
+	// them empty gracefully falls back to file-only.
+	publishers := []publisher.Publisher{publisher.NewFile(snapshotDir)}
+
+	if r2AccountID := os.Getenv("R2_ACCOUNT_ID"); r2AccountID != "" {
+		r2Pub, err := publisher.NewR2(ctx, publisher.R2Config{
+			AccountID:       r2AccountID,
+			AccessKeyID:     os.Getenv("R2_ACCESS_KEY_ID"),
+			SecretAccessKey: os.Getenv("R2_SECRET_ACCESS_KEY"),
+			Bucket:          os.Getenv("R2_BUCKET_NAME"),
+		})
+		if err != nil {
+			return fmt.Errorf("init r2 publisher: %w", err)
+		}
+		publishers = append(publishers, r2Pub)
+		slog.Info("r2 publisher enabled", "bucket", os.Getenv("R2_BUCKET_NAME"))
+	} else {
+		slog.Info("r2 publisher disabled (R2_ACCOUNT_ID not set) — publishing to file only")
+	}
+
+	nwsClient := nws.NewClient(nwsUserAgent)
 	spcClient := spc.NewClient()
-	pub := publisher.NewFilePublisher(snapshotDir)
+	pub := publisher.NewMulti(publishers...)
 
 	p := poller.New(poller.Config{
 		NWS:          nwsClient,
@@ -72,12 +104,14 @@ func run() error {
 		Store:        db,
 		Publisher:    pub,
 		PollInterval: pollInterval,
-		Area:         "WI",
+		Area:         area,
 	})
 
 	slog.Info("starting seestorm-ingest",
 		"poll_interval", pollInterval,
-		"area", "WI",
+		"area", area,
+		"user_agent", nwsUserAgent,
+		"publishers", len(publishers),
 	)
 
 	if err := p.Run(ctx); err != nil {
