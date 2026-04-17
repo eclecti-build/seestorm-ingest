@@ -12,6 +12,10 @@ export DATABASE_URL="postgresql://user:password@localhost:5432/seestorm?sslmode=
 go run ./cmd/ingest
 ```
 
+## Requirements
+
+- Go 1.25+
+
 ## Configuration
 
 | Variable | Default | Description |
