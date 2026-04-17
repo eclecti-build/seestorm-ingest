@@ -17,14 +17,20 @@
 // Additional lat/lon pairs beyond the first are ignored — the first pair is
 // treated as the canonical storm origin for forward-projection rendering.
 //
-// ParseStormMotion is a pure parser: failure cases (no match, malformed
-// numerics, out-of-range lat/lon/direction) return nil. There is no error
-// channel — a nil return means "no motion data available for this alert".
+// ParseStormMotion distinguishes three outcomes via its (motion, error)
+// signature:
+//
+//   - (nil, nil)  — no TIME...MOT...LOC block present in the description.
+//   - (nil, err)  — block present but malformed; err wraps the specific reason.
+//     Callers should log this so NWS format drift surfaces.
+//   - (motion, nil) — parsed successfully.
 package nws
 
 import (
+	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -38,56 +44,82 @@ type StormMotion struct {
 	ValidAt      time.Time `json:"valid_at"`
 }
 
-// motionRe matches the TIME...MOT...LOC header block. Capture groups:
+// motionHeader is a cheap loose-detection string; absence means "no block
+// present" (a legitimate non-error case).
+const motionHeader = "TIME...MOT...LOC"
+
+// motionRe matches the TIME...MOT...LOC header block. The trailing \b ensures
+// a 6-digit longitude like 103456 fails the match rather than being silently
+// truncated to 10345. Multi-vertex descriptions (e.g. "8895 4272 8880") still
+// parse because whitespace after the first longitude satisfies \b.
+//
+// Capture groups:
 //  1. HHMM
 //  2. direction in degrees (up to 3 digits)
 //  3. speed in knots (1+ digits)
 //  4. lat (4 digits)
 //  5. lon (4 or 5 digits)
-var motionRe = regexp.MustCompile(`TIME\.\.\.MOT\.\.\.LOC\s+(\d{4})Z\s+(\d{3})DEG\s+(\d+)KT\s+(\d{4})\s+(\d{4,5})`)
+var motionRe = regexp.MustCompile(`TIME\.\.\.MOT\.\.\.LOC\s+(\d{4})Z\s+(\d{3})DEG\s+(\d+)KT\s+(\d{4})\s+(\d{4,5})\b`)
 
 // ParseStormMotion extracts the first TIME...MOT...LOC block from an NWS alert
-// description. Returns nil when the block is missing or malformed.
+// description.
 //
-// issuedAt is used only to resolve the calendar date of the HHMM stamp. If the
-// naively-combined date-plus-time lands more than an hour in the future
-// relative to issuedAt, the result is rolled back by 24h to handle the case
-// where the alert was issued just after UTC midnight but the motion snapshot
-// was taken just before.
-func ParseStormMotion(description string, issuedAt time.Time) *StormMotion {
+// Return semantics:
+//   - (nil, nil)  — the description contains no TIME...MOT...LOC header at all.
+//     This is expected for alerts without a motion vector (flood watches, etc.)
+//     and is not an error.
+//   - (nil, err)  — a header was found but parsing failed (regex mismatch,
+//     out-of-range direction/lat/lon, invalid HHMM). The caller should log
+//     this to catch NWS format drift.
+//   - (motion, nil) — success.
+//
+// issuedAt is the anchor timestamp used to resolve the calendar date of the
+// HHMM stamp. NWS encodes only HHMM, no date. Day rollover is bidirectional:
+// the result is flipped by ±24h to whichever direction places validAt closest
+// to issuedAt within ±12h. This handles both "alert issued just after UTC
+// midnight, motion captured just before" and the symmetric forward case, and
+// stays correct if the caller passes an anchor (sent_at, effective_at,
+// ingested_at) that drifts by up to several hours from the true issuance time.
+// Storm-motion captures are always within about an hour of issuance in
+// practice.
+func ParseStormMotion(description string, issuedAt time.Time) (*StormMotion, error) {
+	if !strings.Contains(description, motionHeader) {
+		return nil, nil
+	}
+
 	m := motionRe.FindStringSubmatch(description)
 	if m == nil {
-		return nil
+		return nil, fmt.Errorf("parsing storm motion: header present but regex did not match")
 	}
 
 	hhmm := m[1]
 	hours, err := strconv.Atoi(hhmm[:2])
 	if err != nil || hours < 0 || hours > 23 {
-		return nil
+		return nil, fmt.Errorf("parsing storm motion: invalid HHMM hour %q", hhmm)
 	}
 	minutes, err := strconv.Atoi(hhmm[2:])
 	if err != nil || minutes < 0 || minutes > 59 {
-		return nil
+		return nil, fmt.Errorf("parsing storm motion: invalid HHMM minute %q", hhmm)
 	}
 
 	direction, err := strconv.Atoi(m[2])
 	if err != nil || direction < 0 || direction >= 360 {
-		return nil
+		return nil, fmt.Errorf("parsing storm motion: direction %q out of range [0,360)", m[2])
 	}
 
 	speed, err := strconv.Atoi(m[3])
 	if err != nil || speed < 0 {
-		return nil
+		return nil, fmt.Errorf("parsing storm motion: invalid speed %q", m[3])
 	}
 
 	lat, ok := parseLat(m[4])
 	if !ok {
-		return nil
+		return nil, fmt.Errorf("parsing storm motion: latitude %q out of range", m[4])
 	}
 
 	lon, ok := parseLon(m[5])
 	if !ok {
-		return nil
+		return nil, fmt.Errorf("parsing storm motion: longitude %q out of range", m[5])
 	}
 
 	issuedUTC := issuedAt.UTC()
@@ -95,10 +127,18 @@ func ParseStormMotion(description string, issuedAt time.Time) *StormMotion {
 		issuedUTC.Year(), issuedUTC.Month(), issuedUTC.Day(),
 		hours, minutes, 0, 0, time.UTC,
 	)
-	// Day-rollover: if naive combine is more than 1h in the future, the HHMM
-	// was captured the previous UTC day (alert issued just after midnight Z).
-	if validAt.Sub(issuedUTC) > time.Hour {
+	// Day rollover: NWS encodes only HHMM, no date. The issuance timestamp
+	// anchors which UTC date the TIME belongs to, but it may be off by a few
+	// hours (e.g. when callers pass effective_at instead of sent_at). Flip
+	// the inferred date by 24h whichever direction places validAt closest to
+	// issuedAt within ±12h. Valid storm-motion TIMEs are always within an
+	// hour or so of issuance in practice.
+	diff := validAt.Sub(issuedUTC)
+	switch {
+	case diff > 12*time.Hour:
 		validAt = validAt.Add(-24 * time.Hour)
+	case diff < -12*time.Hour:
+		validAt = validAt.Add(24 * time.Hour)
 	}
 
 	return &StormMotion{
@@ -107,7 +147,7 @@ func ParseStormMotion(description string, issuedAt time.Time) *StormMotion {
 		DirectionDeg: direction,
 		SpeedKt:      speed,
 		ValidAt:      validAt,
-	}
+	}, nil
 }
 
 // parseLat converts a 4-digit NWS lat token (DDdd) to decimal degrees. Returns

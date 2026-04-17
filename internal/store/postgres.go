@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -133,7 +134,14 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 		if geomStr != nil {
 			a.Geometry = json.RawMessage(*geomStr)
 		}
-		a.StormMotion = nws.ParseStormMotion(a.Description, a.EffectiveAt)
+		motion, err := nws.ParseStormMotion(a.Description, a.EffectiveAt)
+		if err != nil {
+			slog.WarnContext(ctx, "storm motion parse failed",
+				"nws_id", a.NWSID,
+				"error", err,
+			)
+		}
+		a.StormMotion = motion
 		alerts = append(alerts, a)
 	}
 

@@ -41,6 +41,18 @@ HAILCAP...<.75IN
 TORNADOCAP...OBSERVED
 `
 
+// outcome classifies the expected return triple from ParseStormMotion.
+type outcome int
+
+const (
+	// outcomeOK: (non-nil motion, nil error) — the happy path.
+	outcomeOK outcome = iota
+	// outcomeAbsent: (nil, nil) — no TIME...MOT...LOC header at all.
+	outcomeAbsent
+	// outcomeMalformed: (nil, non-nil error) — header present, parse failed.
+	outcomeMalformed
+)
+
 func TestParseStormMotion(t *testing.T) {
 	t.Parallel()
 
@@ -48,12 +60,14 @@ func TestParseStormMotion(t *testing.T) {
 		name        string
 		description string
 		issuedAt    time.Time
-		want        *StormMotion
+		outcome     outcome
+		want        *StormMotion // only checked when outcome == outcomeOK
 	}{
 		{
 			name:        "happy path",
 			description: "TIME...MOT...LOC 0145Z 270DEG 30KT 4258 8947",
 			issuedAt:    mustTime(t, "2026-04-17T01:40:00Z"),
+			outcome:     outcomeOK,
 			want: &StormMotion{
 				OriginLat:    42.58,
 				OriginLon:    -89.47,
@@ -66,6 +80,7 @@ func TestParseStormMotion(t *testing.T) {
 			name:        "5-digit longitude",
 			description: "TIME...MOT...LOC 0145Z 270DEG 30KT 4258 10345",
 			issuedAt:    mustTime(t, "2026-04-17T01:40:00Z"),
+			outcome:     outcomeOK,
 			want: &StormMotion{
 				OriginLat:    42.58,
 				OriginLon:    -103.45,
@@ -75,27 +90,28 @@ func TestParseStormMotion(t *testing.T) {
 			},
 		},
 		{
-			name:        "no match returns nil",
+			name:        "no header returns (nil, nil)",
 			description: "SEVERE THUNDERSTORM WARNING for south-central Wisconsin.",
 			issuedAt:    mustTime(t, "2026-04-17T01:40:00Z"),
-			want:        nil,
+			outcome:     outcomeAbsent,
 		},
 		{
-			name:        "truncated after header returns nil",
+			name:        "truncated after header returns error",
 			description: "TIME...MOT...LOC ",
 			issuedAt:    mustTime(t, "2026-04-17T01:40:00Z"),
-			want:        nil,
+			outcome:     outcomeMalformed,
 		},
 		{
-			name:        "non-digit in direction returns nil",
+			name:        "non-digit in direction returns error",
 			description: "TIME...MOT...LOC 0145Z 27ADEG 30KT 4258 8947",
 			issuedAt:    mustTime(t, "2026-04-17T01:40:00Z"),
-			want:        nil,
+			outcome:     outcomeMalformed,
 		},
 		{
-			name:        "day rollover future-guard subtracts 24h",
+			name:        "day rollover backward subtracts 24h",
 			description: "TIME...MOT...LOC 2355Z 180DEG 25KT 4300 8900",
 			issuedAt:    mustTime(t, "2026-04-17T00:05:00Z"),
+			outcome:     outcomeOK,
 			want: &StormMotion{
 				OriginLat:    43.00,
 				OriginLon:    -89.00,
@@ -105,9 +121,39 @@ func TestParseStormMotion(t *testing.T) {
 			},
 		},
 		{
+			name:        "day rollover forward adds 24h",
+			description: "TIME...MOT...LOC 0005Z 180DEG 25KT 4300 8900",
+			issuedAt:    mustTime(t, "2026-04-16T23:55:00Z"),
+			outcome:     outcomeOK,
+			want: &StormMotion{
+				OriginLat:    43.00,
+				OriginLon:    -89.00,
+				DirectionDeg: 180,
+				SpeedKt:      25,
+				ValidAt:      mustTime(t, "2026-04-17T00:05:00Z"),
+			},
+		},
+		{
+			// Simulates a 6h-late anchor (e.g. effective_at drifts from sent_at).
+			// Naive combine = 2026-04-17T00:01Z, diff = -5h59m, within ±12h so
+			// no flip — still resolves to the same UTC date as the anchor.
+			name:        "anchor drift within window does not flip",
+			description: "TIME...MOT...LOC 0001Z 180DEG 25KT 4300 8900",
+			issuedAt:    mustTime(t, "2026-04-17T06:00:00Z"),
+			outcome:     outcomeOK,
+			want: &StormMotion{
+				OriginLat:    43.00,
+				OriginLon:    -89.00,
+				DirectionDeg: 180,
+				SpeedKt:      25,
+				ValidAt:      mustTime(t, "2026-04-17T00:01:00Z"),
+			},
+		},
+		{
 			name:        "same-day normal no adjustment",
 			description: "TIME...MOT...LOC 2355Z 180DEG 25KT 4300 8900",
 			issuedAt:    mustTime(t, "2026-04-17T23:55:00Z"),
+			outcome:     outcomeOK,
 			want: &StormMotion{
 				OriginLat:    43.00,
 				OriginLon:    -89.00,
@@ -120,6 +166,7 @@ func TestParseStormMotion(t *testing.T) {
 			name:        "zero speed still parses",
 			description: "TIME...MOT...LOC 0145Z 270DEG 0KT 4258 8947",
 			issuedAt:    mustTime(t, "2026-04-17T01:40:00Z"),
+			outcome:     outcomeOK,
 			want: &StormMotion{
 				OriginLat:    42.58,
 				OriginLon:    -89.47,
@@ -132,6 +179,7 @@ func TestParseStormMotion(t *testing.T) {
 			name:        "tabs and double spaces between tokens",
 			description: "TIME...MOT...LOC\t0145Z  270DEG\t30KT  4258\t8947",
 			issuedAt:    mustTime(t, "2026-04-17T01:40:00Z"),
+			outcome:     outcomeOK,
 			want: &StormMotion{
 				OriginLat:    42.58,
 				OriginLon:    -89.47,
@@ -146,6 +194,7 @@ func TestParseStormMotion(t *testing.T) {
 				"... later ...\n" +
 				"TIME...MOT...LOC 0200Z 090DEG 50KT 4300 9000",
 			issuedAt: mustTime(t, "2026-04-17T01:40:00Z"),
+			outcome:  outcomeOK,
 			want: &StormMotion{
 				OriginLat:    42.58,
 				OriginLon:    -89.47,
@@ -160,6 +209,7 @@ func TestParseStormMotion(t *testing.T) {
 				"TIME...MOT...LOC 0145Z 270DEG 30KT 4258 8947\n\n" +
 				"HAZARD...60 mph wind gusts.\n",
 			issuedAt: mustTime(t, "2026-04-17T01:40:00Z"),
+			outcome:  outcomeOK,
 			want: &StormMotion{
 				OriginLat:    42.58,
 				OriginLon:    -89.47,
@@ -169,9 +219,13 @@ func TestParseStormMotion(t *testing.T) {
 			},
 		},
 		{
+			// Multi-vertex real-NWS sample: the first pair (4268 8895) wins,
+			// and the \b boundary after the first longitude is satisfied by
+			// the whitespace before the second vertex.
 			name:        "real-world WI tornado warning sample",
 			description: realWorldSample,
 			issuedAt:    mustTime(t, "2026-04-17T23:45:00Z"),
+			outcome:     outcomeOK,
 			want: &StormMotion{
 				OriginLat:    42.68,
 				OriginLon:    -88.95,
@@ -181,28 +235,36 @@ func TestParseStormMotion(t *testing.T) {
 			},
 		},
 		{
-			name:        "direction out of range 360 returns nil",
+			name:        "direction out of range 360 returns error",
 			description: "TIME...MOT...LOC 0145Z 360DEG 30KT 4258 8947",
 			issuedAt:    mustTime(t, "2026-04-17T01:40:00Z"),
-			want:        nil,
+			outcome:     outcomeMalformed,
 		},
 		{
-			name:        "lat out of CONUS range returns nil",
+			name:        "lat out of CONUS range returns error",
 			description: "TIME...MOT...LOC 0145Z 270DEG 30KT 9999 8947",
 			issuedAt:    mustTime(t, "2026-04-17T01:40:00Z"),
-			want:        nil,
+			outcome:     outcomeMalformed,
 		},
 		{
-			name:        "lon out of range returns nil",
+			name:        "lon out of range returns error",
 			description: "TIME...MOT...LOC 0145Z 270DEG 30KT 4258 19999",
 			issuedAt:    mustTime(t, "2026-04-17T01:40:00Z"),
-			want:        nil,
+			outcome:     outcomeMalformed,
 		},
 		{
-			name:        "invalid hour HHMM returns nil",
+			name:        "invalid hour HHMM returns error",
 			description: "TIME...MOT...LOC 2545Z 270DEG 30KT 4258 8947",
 			issuedAt:    mustTime(t, "2026-04-17T01:40:00Z"),
-			want:        nil,
+			outcome:     outcomeMalformed,
+		},
+		{
+			// 6-digit longitude 103456 must NOT silently truncate to 10345.
+			// The \b boundary after the longitude capture rejects this.
+			name:        "6-digit longitude rejected",
+			description: "TIME...MOT...LOC 0145Z 270DEG 30KT 4258 103456",
+			issuedAt:    mustTime(t, "2026-04-17T01:40:00Z"),
+			outcome:     outcomeMalformed,
 		},
 	}
 
@@ -210,32 +272,44 @@ func TestParseStormMotion(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := ParseStormMotion(tt.description, tt.issuedAt)
+			got, err := ParseStormMotion(tt.description, tt.issuedAt)
 
-			if tt.want == nil {
-				if got != nil {
-					t.Fatalf("expected nil, got %+v", got)
+			switch tt.outcome {
+			case outcomeAbsent:
+				if got != nil || err != nil {
+					t.Fatalf("expected (nil, nil), got (%+v, %v)", got, err)
 				}
 				return
-			}
-
-			if got == nil {
-				t.Fatalf("expected %+v, got nil", tt.want)
-			}
-			if !floatEq(got.OriginLat, tt.want.OriginLat) {
-				t.Errorf("OriginLat: got %v, want %v", got.OriginLat, tt.want.OriginLat)
-			}
-			if !floatEq(got.OriginLon, tt.want.OriginLon) {
-				t.Errorf("OriginLon: got %v, want %v", got.OriginLon, tt.want.OriginLon)
-			}
-			if got.DirectionDeg != tt.want.DirectionDeg {
-				t.Errorf("DirectionDeg: got %d, want %d", got.DirectionDeg, tt.want.DirectionDeg)
-			}
-			if got.SpeedKt != tt.want.SpeedKt {
-				t.Errorf("SpeedKt: got %d, want %d", got.SpeedKt, tt.want.SpeedKt)
-			}
-			if !got.ValidAt.Equal(tt.want.ValidAt) {
-				t.Errorf("ValidAt: got %s, want %s", got.ValidAt, tt.want.ValidAt)
+			case outcomeMalformed:
+				if got != nil {
+					t.Fatalf("expected nil motion, got %+v", got)
+				}
+				if err == nil {
+					t.Fatal("expected non-nil error for malformed block, got nil")
+				}
+				return
+			case outcomeOK:
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got == nil {
+					t.Fatalf("expected %+v, got nil", tt.want)
+				}
+				if !floatEq(got.OriginLat, tt.want.OriginLat) {
+					t.Errorf("OriginLat: got %v, want %v", got.OriginLat, tt.want.OriginLat)
+				}
+				if !floatEq(got.OriginLon, tt.want.OriginLon) {
+					t.Errorf("OriginLon: got %v, want %v", got.OriginLon, tt.want.OriginLon)
+				}
+				if got.DirectionDeg != tt.want.DirectionDeg {
+					t.Errorf("DirectionDeg: got %d, want %d", got.DirectionDeg, tt.want.DirectionDeg)
+				}
+				if got.SpeedKt != tt.want.SpeedKt {
+					t.Errorf("SpeedKt: got %d, want %d", got.SpeedKt, tt.want.SpeedKt)
+				}
+				if !got.ValidAt.Equal(tt.want.ValidAt) {
+					t.Errorf("ValidAt: got %s, want %s", got.ValidAt, tt.want.ValidAt)
+				}
 			}
 		})
 	}
