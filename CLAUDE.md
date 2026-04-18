@@ -30,10 +30,14 @@ See `Makefile` for the full target list.
 - `ent/migrate/migrations/` — Atlas-managed migration SQL
 
 ## Data Flow
-1. Poll NWS alerts API every 30s for active WI alerts
+1. Poll NWS alerts API every 30s for active alerts in the configured `NWS_AREA`(s) — accepts a single state code or a comma-separated list (e.g. `WI` or `MN,WI,IL,IN,MI,OH,PA,NY`).
 2. Poll SPC CSVs for today's storm reports
 3. Deduplicate and upsert to PostGIS
 4. Publish `active-events.json` snapshot to local disk and Cloudflare R2
+
+The published snapshot carries a `schema_version` field; the client refuses
+to render an unrecognized version. Bump `publisher.SnapshotSchemaVersion`
+when the wire shape changes and coordinate the client PR before deploying.
 
 ## Auth
 **None.** The ingest service exposes no authenticated endpoints today — its output (snapshot JSON on Cloudflare R2) is public by design. Public safety data stays frictionless.

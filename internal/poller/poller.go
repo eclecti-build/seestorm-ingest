@@ -3,6 +3,8 @@ package poller
 import (
 	"context"
 	"log/slog"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/eclecti-build/seestorm-ingest/internal/nws"
@@ -17,7 +19,10 @@ type Config struct {
 	Store        *store.Store
 	Publisher    publisher.Publisher
 	PollInterval time.Duration
-	Area         string
+	// Areas is the set of US state codes to poll. The NWS API accepts a
+	// comma-separated list as a single `?area=` query, so multi-state
+	// polling stays one HTTP request regardless of slice length.
+	Areas []string
 }
 
 type Poller struct {
@@ -88,7 +93,9 @@ func (p *Poller) poll(ctx context.Context) {
 }
 
 func (p *Poller) pollAlerts(ctx context.Context) int {
-	alerts, err := p.cfg.NWS.FetchActiveAlerts(ctx, p.cfg.Area)
+	// NWS supports a comma-separated `area` value natively, so multi-state
+	// polling is one request rather than N. See nws.FetchActiveAlerts docs.
+	alerts, err := p.cfg.NWS.FetchActiveAlerts(ctx, strings.Join(p.cfg.Areas, ","))
 	if err != nil {
 		slog.Error("failed to fetch alerts", "error", err)
 		return 0
@@ -143,6 +150,12 @@ func (p *Poller) pollStormReports(ctx context.Context) int {
 	return count
 }
 
+// publishTimeout is the per-call deadline for a single Publish or
+// PublishState invocation. Bounds the worst case so a single hung R2 PUT
+// can't block the rest of the cycle. Generous vs. typical R2 PUT latency
+// (sub-second) but well below the 30s polling interval.
+const publishTimeout = 5 * time.Second
+
 func (p *Poller) publishSnapshot(ctx context.Context) {
 	alerts, err := p.cfg.Store.GetActiveAlerts(ctx)
 	if err != nil {
@@ -150,14 +163,73 @@ func (p *Poller) publishSnapshot(ctx context.Context) {
 		return
 	}
 
-	snapshot := publisher.Snapshot{
-		GeneratedAt: time.Now().UTC(),
-		Area:        p.cfg.Area,
-		AlertCount:  len(alerts),
-		Alerts:      alerts,
-	}
+	// Use a single timestamp across the merged + per-state snapshots so
+	// clients merging in-memory don't see split-time payloads.
+	generatedAt := time.Now().UTC()
 
-	if err := p.cfg.Publisher.Publish(ctx, snapshot); err != nil {
-		slog.ErrorContext(ctx, "failed to publish snapshot", "error", err)
+	// Merged snapshot — the back-compat path and the "view all" UX. Goes
+	// through the publisher's history archival as well.
+	snapshot := publisher.Snapshot{
+		SchemaVersion: publisher.SnapshotSchemaVersion,
+		GeneratedAt:   generatedAt,
+		Areas:         p.cfg.Areas,
+		AlertCount:    len(alerts),
+		Alerts:        alerts,
 	}
+	p.publishWithTimeout(ctx, "merged", "", func(timeoutCtx context.Context) error {
+		return p.cfg.Publisher.Publish(timeoutCtx, snapshot)
+	})
+
+	// Per-state snapshots — one per configured area, written to
+	// active-events/<STATE>.json. Cross-border alerts (states ⊃ {STATE})
+	// appear in every matching state's file, which is the natural
+	// semantics for an alert footprint that genuinely touches multiple
+	// states. Alerts with no resolved States[] don't appear in any
+	// per-state file (they remain in the merged snapshot only) — this
+	// degrades gracefully for upstream payloads we can't classify.
+	for _, state := range p.cfg.Areas {
+		filtered := filterAlertsByState(alerts, state)
+		stateSnapshot := publisher.StateSnapshot{
+			SchemaVersion: publisher.SnapshotSchemaVersion,
+			GeneratedAt:   generatedAt,
+			AreaState:     state,
+			AlertCount:    len(filtered),
+			Alerts:        filtered,
+		}
+		p.publishWithTimeout(ctx, "state", state, func(timeoutCtx context.Context) error {
+			return p.cfg.Publisher.PublishState(timeoutCtx, stateSnapshot)
+		})
+	}
+}
+
+// publishWithTimeout wraps a single publish call in a bounded deadline so
+// one hung destination (typically an R2 PUT during a Cloudflare degradation)
+// can't starve the rest of the publish fan-out. Logs failures with kind +
+// state context for triage; never returns an error because publish failures
+// are non-fatal for the polling loop (next cycle in 30s will overwrite).
+func (p *Poller) publishWithTimeout(parent context.Context, kind, state string, fn func(context.Context) error) {
+	ctx, cancel := context.WithTimeout(parent, publishTimeout)
+	defer cancel()
+	if err := fn(ctx); err != nil {
+		attrs := []any{"kind", kind, "error", err}
+		if state != "" {
+			attrs = append(attrs, "state", state)
+		}
+		slog.ErrorContext(parent, "publish failed", attrs...)
+	}
+}
+
+// filterAlertsByState returns the subset of alerts whose States slice
+// contains the given state code. Used to shard the merged snapshot into
+// per-state files. O(n*m) where n = alert count, m = average states/alert
+// (typically 1-2) — fine at our volumes (low hundreds of alerts during a
+// major outbreak).
+func filterAlertsByState(alerts []store.ActiveAlertGeoJSON, state string) []store.ActiveAlertGeoJSON {
+	out := make([]store.ActiveAlertGeoJSON, 0, len(alerts))
+	for _, a := range alerts {
+		if slices.Contains(a.States, state) {
+			out = append(out, a)
+		}
+	}
+	return out
 }

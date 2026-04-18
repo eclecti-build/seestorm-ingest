@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -15,6 +17,11 @@ import (
 	"github.com/eclecti-build/seestorm-ingest/internal/spc"
 	"github.com/eclecti-build/seestorm-ingest/internal/store"
 )
+
+// stateCodeRE validates each token in the NWS_AREA list. NWS expects
+// uppercase 2-letter USPS state codes; anything else is dropped with a warning
+// rather than failing startup.
+var stateCodeRE = regexp.MustCompile(`^[A-Z]{2}$`)
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -46,9 +53,9 @@ func run() error {
 		nwsUserAgent = "(seestorm.org, contact@seestorm.org)"
 	}
 
-	area := os.Getenv("NWS_AREA")
-	if area == "" {
-		area = "WI"
+	areas := parseAreas(os.Getenv("NWS_AREA"))
+	if len(areas) == 0 {
+		return fmt.Errorf("NWS_AREA resolved to no valid state codes")
 	}
 
 	pollInterval := 30 * time.Second
@@ -104,12 +111,12 @@ func run() error {
 		Store:        db,
 		Publisher:    pub,
 		PollInterval: pollInterval,
-		Area:         area,
+		Areas:        areas,
 	})
 
 	slog.Info("starting seestorm-ingest",
 		"poll_interval", pollInterval,
-		"area", area,
+		"areas", areas,
 		"user_agent", nwsUserAgent,
 		"publishers", len(publishers),
 	)
@@ -119,4 +126,37 @@ func run() error {
 	}
 
 	return nil
+}
+
+// parseAreas turns a raw NWS_AREA env value into the slice of state codes
+// passed to the poller. Tokens are trimmed, uppercased, validated against
+// both the USPS 2-letter pattern AND the actual NWS state/territory
+// allowlist, and de-duplicated. Invalid tokens are logged and skipped
+// rather than failing startup so a single typo doesn't take down the whole
+// service. Empty / unset input falls back to ["WI"] to preserve the
+// historical single-state default.
+//
+// Validating against the allowlist (not just the regex) prevents a typo
+// like `ZZ` or `XX` from passing through to api.weather.gov — those would
+// match the regex shape but return zero alerts and silently drop coverage
+// for whatever state the user meant.
+func parseAreas(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return []string{"WI"}
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 8)
+	for _, token := range strings.Split(raw, ",") {
+		code := strings.ToUpper(strings.TrimSpace(token))
+		if !stateCodeRE.MatchString(code) || !nws.IsValidStateCode(code) {
+			slog.Warn("ignoring invalid NWS_AREA token", "token", token)
+			continue
+		}
+		if _, dup := seen[code]; dup {
+			continue
+		}
+		seen[code] = struct{}{}
+		out = append(out, code)
+	}
+	return out
 }

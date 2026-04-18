@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -99,7 +101,13 @@ func (s *Store) UpsertStormReport(ctx context.Context, report spc.StormReport) e
 	return nil
 }
 
-// ActiveAlertGeoJSON represents a single alert for the snapshot
+// ActiveAlertGeoJSON represents a single alert for the snapshot.
+//
+// `States` is the set of US state abbreviations the alert covers, derived from
+// the NWS `properties.geocode.SAME` codes (preferred) or parsed from
+// `area_desc` as a fallback. Plural because cross-border alerts (Mississippi
+// River flooding, multi-state derechos) are real and the client filters on
+// this field when scoping by user location.
 type ActiveAlertGeoJSON struct {
 	NWSID       string           `json:"nws_id"`
 	EventType   string           `json:"event_type"`
@@ -107,6 +115,7 @@ type ActiveAlertGeoJSON struct {
 	Headline    string           `json:"headline"`
 	Description string           `json:"description"`
 	AreaDesc    string           `json:"area_desc"`
+	States      []string         `json:"states"`
 	Geometry    json.RawMessage  `json:"geometry"`
 	EffectiveAt time.Time        `json:"effective_at"`
 	ExpiresAt   time.Time        `json:"expires_at"`
@@ -115,10 +124,13 @@ type ActiveAlertGeoJSON struct {
 }
 
 // alertPropsParams is the minimal shape we unmarshal out of the JSONB
-// `properties` column to surface `parameters` for motion parsing. Decoding
-// the full AlertProperties here is wasteful — we only need `parameters`.
+// `properties` column. We surface `parameters` for motion parsing and
+// `geocode` for state derivation. Decoding the full AlertProperties
+// here is wasteful — we only need these two fields. We share `nws.AlertGeocode`
+// with the upstream marshaler so the wire shape can't silently drift.
 type alertPropsParams struct {
 	Parameters map[string][]string `json:"parameters"`
+	Geocode    nws.AlertGeocode    `json:"geocode"`
 }
 
 func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, error) {
@@ -129,10 +141,12 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 	defer rows.Close()
 
 	var (
-		alerts       []ActiveAlertGeoJSON
-		motionParsed int
-		motionAbsent int
-		motionFailed int
+		alerts         []ActiveAlertGeoJSON
+		motionParsed   int
+		motionAbsent   int
+		motionFailed   int
+		statesFromSAME int
+		statesFallback int
 	)
 	for rows.Next() {
 		var a ActiveAlertGeoJSON
@@ -179,6 +193,19 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 		// or not we got a vector.
 		a.StormMotion = motion
 
+		// Derive states from SAME codes (preferred — structured, unambiguous).
+		// Fall back to area_desc parsing only if no SAME codes are present
+		// or none resolved to a known state. The fallback counter exists so
+		// we can spot upstream changes (e.g. NWS dropping geocode.SAME) in
+		// log aggregation rather than discovering it during an event.
+		states, usedFallback := deriveStates(props.Geocode.SAME, a.AreaDesc)
+		if usedFallback {
+			statesFallback++
+		} else {
+			statesFromSAME++
+		}
+		a.States = states
+
 		// Parse IBW warning tags for Tornado / Severe Thunderstorm /
 		// Flash Flood warnings. Watches + statements lack the `&&`
 		// block, so ParseWarningTags returns (nil, nil) for them and
@@ -208,5 +235,58 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 		"failed", motionFailed,
 	)
 
+	slog.InfoContext(ctx, "snapshot state derivation stats",
+		"from_same", statesFromSAME,
+		"from_area_desc_fallback", statesFallback,
+	)
+
 	return alerts, nil
+}
+
+// deriveStates resolves the set of US state abbreviations covered by an
+// alert. Preferred source is the NWS `geocode.SAME` codes (structured,
+// unambiguous — first 2 digits map to the FIPS state). Fallback is naive
+// parsing of `area_desc` for trailing `, XX` tokens (NWS uses the format
+// "County Name, XX" separated by `;`).
+//
+// Returns (states, usedFallback). `usedFallback` is true when SAME yielded
+// no recognized states and area_desc parsing was used. Callers should
+// instrument this in log aggregation to surface upstream changes.
+func deriveStates(sameCodes []string, areaDesc string) ([]string, bool) {
+	seen := map[string]struct{}{}
+	for _, code := range sameCodes {
+		if state, ok := nws.StateForSAMECode(code); ok {
+			seen[state] = struct{}{}
+		}
+	}
+
+	usedFallback := false
+	if len(seen) == 0 && areaDesc != "" {
+		usedFallback = true
+		for _, segment := range strings.Split(areaDesc, ";") {
+			segment = strings.TrimSpace(segment)
+			if comma := strings.LastIndex(segment, ","); comma >= 0 {
+				candidate := strings.TrimSpace(segment[comma+1:])
+				if len(candidate) == 2 {
+					upper := strings.ToUpper(candidate)
+					// Only accept if the abbreviation is a known state code.
+					// Guards against "NEAR THE LAKE, ETC" garbage.
+					if nws.IsValidStateCode(upper) {
+						seen[upper] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+
+	// Always return a non-nil slice so the wire shape is uniform.
+	// `States []string` has no `omitempty` and Go marshals nil slices as
+	// `null` — that breaks the v2 contract (`states[]` is documented as an
+	// array). Empty alerts therefore must serialize to `[]`, not `null`.
+	out := make([]string, 0, len(seen))
+	for s := range seen {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out, usedFallback
 }
