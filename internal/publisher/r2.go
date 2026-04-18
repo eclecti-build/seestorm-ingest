@@ -83,9 +83,12 @@ func (p *R2) Publish(ctx context.Context, snapshot Snapshot) error {
 		key          string
 		cacheControl string
 	}{
-		// Live snapshot — short cache so edge absorbs burst load but clients
-		// see fresh data within one poll interval.
-		{SnapshotKey, "public, max-age=10, s-maxage=10"},
+		// Live snapshot — 30s cache aligns to the 30s ingest cadence, so
+		// edges hit R2 at most once per PoP per cycle. Worker overrides
+		// with the same value via LIVE_CACHE_CONTROL — keep them in sync
+		// so the ingest write and the worker response don't disagree on
+		// freshness contract.
+		{SnapshotKey, "public, max-age=30, s-maxage=30"},
 		// Historical snapshot — immutable once written, cache for a year.
 		{historyKey, "public, max-age=31536000, immutable"},
 	}
@@ -110,6 +113,47 @@ func (p *R2) Publish(ctx context.Context, snapshot Snapshot) error {
 		"history_key", historyKey,
 		"size_bytes", len(data),
 		"alert_count", snapshot.AlertCount,
+		"duration", time.Since(start),
+	)
+
+	return nil
+}
+
+// PublishState writes a per-state snapshot to R2 at PerStateKey(state).
+// Per-state files are NOT historized — only the merged file goes into the
+// history archive (one file per poll, not one per state per poll). Keeping
+// history unsharded bounds R2 object growth at 2,880 keys/day instead of
+// 23,040/day for an 8-state Great Lakes deployment.
+func (p *R2) PublishState(ctx context.Context, snapshot StateSnapshot) error {
+	start := time.Now()
+
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		return fmt.Errorf("marshaling state snapshot: %w", err)
+	}
+
+	key := PerStateKey(snapshot.AreaState)
+
+	_, err = p.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(p.bucket),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader(data),
+		ContentType: aws.String("application/json; charset=utf-8"),
+		// Same 30s contract as the merged file — worker LIVE_CACHE_CONTROL
+		// covers both routes uniformly.
+		CacheControl: aws.String("public, max-age=30, s-maxage=30"),
+	})
+	if err != nil {
+		return fmt.Errorf("r2 put %s/%s: %w", p.bucket, key, err)
+	}
+
+	slog.InfoContext(ctx, "state snapshot published",
+		"destination", "r2",
+		"bucket", p.bucket,
+		"key", key,
+		"size_bytes", len(data),
+		"alert_count", snapshot.AlertCount,
+		"area_state", snapshot.AreaState,
 		"duration", time.Since(start),
 	)
 

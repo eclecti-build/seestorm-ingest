@@ -3,6 +3,7 @@ package poller
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -156,15 +157,59 @@ func (p *Poller) publishSnapshot(ctx context.Context) {
 		return
 	}
 
+	// Use a single timestamp across the merged + per-state snapshots so
+	// clients merging in-memory don't see split-time payloads.
+	generatedAt := time.Now().UTC()
+
+	// Merged snapshot — the back-compat path and the "view all" UX. Goes
+	// through the publisher's history archival as well.
 	snapshot := publisher.Snapshot{
 		SchemaVersion: publisher.SnapshotSchemaVersion,
-		GeneratedAt:   time.Now().UTC(),
+		GeneratedAt:   generatedAt,
 		Areas:         p.cfg.Areas,
 		AlertCount:    len(alerts),
 		Alerts:        alerts,
 	}
-
 	if err := p.cfg.Publisher.Publish(ctx, snapshot); err != nil {
-		slog.ErrorContext(ctx, "failed to publish snapshot", "error", err)
+		slog.ErrorContext(ctx, "failed to publish merged snapshot", "error", err)
 	}
+
+	// Per-state snapshots — one per configured area, written to
+	// active-events/<STATE>.json. Cross-border alerts (states ⊃ {STATE})
+	// appear in every matching state's file, which is the natural
+	// semantics for an alert footprint that genuinely touches multiple
+	// states. Alerts with no resolved States[] don't appear in any
+	// per-state file (they remain in the merged snapshot only) — this
+	// degrades gracefully for upstream payloads we can't classify.
+	for _, state := range p.cfg.Areas {
+		filtered := filterAlertsByState(alerts, state)
+		stateSnapshot := publisher.StateSnapshot{
+			SchemaVersion: publisher.SnapshotSchemaVersion,
+			GeneratedAt:   generatedAt,
+			AreaState:     state,
+			AlertCount:    len(filtered),
+			Alerts:        filtered,
+		}
+		if err := p.cfg.Publisher.PublishState(ctx, stateSnapshot); err != nil {
+			slog.ErrorContext(ctx, "failed to publish state snapshot",
+				"state", state,
+				"error", err,
+			)
+		}
+	}
+}
+
+// filterAlertsByState returns the subset of alerts whose States slice
+// contains the given state code. Used to shard the merged snapshot into
+// per-state files. O(n*m) where n = alert count, m = average states/alert
+// (typically 1-2) — fine at our volumes (low hundreds of alerts during a
+// major outbreak).
+func filterAlertsByState(alerts []store.ActiveAlertGeoJSON, state string) []store.ActiveAlertGeoJSON {
+	out := make([]store.ActiveAlertGeoJSON, 0, len(alerts))
+	for _, a := range alerts {
+		if slices.Contains(a.States, state) {
+			out = append(out, a)
+		}
+	}
+	return out
 }

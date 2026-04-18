@@ -1,7 +1,9 @@
 package publisher
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -116,6 +118,147 @@ func TestSnapshotJSON_OmitsStormMotionWhenNil(t *testing.T) {
 
 	if strings.Contains(string(raw), `"storm_motion"`) {
 		t.Fatalf("expected storm_motion to be omitted, got:\n%s", raw)
+	}
+}
+
+// stubPublisher records calls for fan-out tests.
+type stubPublisher struct {
+	mergedCalls []Snapshot
+	stateCalls  []StateSnapshot
+	failMerged  error
+	failState   error
+}
+
+func (s *stubPublisher) Publish(_ context.Context, snap Snapshot) error {
+	s.mergedCalls = append(s.mergedCalls, snap)
+	return s.failMerged
+}
+
+func (s *stubPublisher) PublishState(_ context.Context, snap StateSnapshot) error {
+	s.stateCalls = append(s.stateCalls, snap)
+	return s.failState
+}
+
+// TestMultiFanOutBoth asserts both Publish AND PublishState fan out to
+// every registered destination, even when one fails. This is the contract
+// that lets us add R2 next to the local file publisher without coupling
+// failures (an R2 hiccup must not silence the on-disk debug snapshot).
+func TestMultiFanOutBoth(t *testing.T) {
+	t.Parallel()
+
+	a := &stubPublisher{}
+	b := &stubPublisher{failMerged: errors.New("R2 boom")}
+	multi := NewMulti(a, b)
+
+	mergedErr := multi.Publish(context.Background(), Snapshot{
+		SchemaVersion: SnapshotSchemaVersion,
+		Areas:         []string{"WI"},
+	})
+	if mergedErr == nil {
+		t.Errorf("expected first error to surface, got nil")
+	}
+	if len(a.mergedCalls) != 1 || len(b.mergedCalls) != 1 {
+		t.Errorf("Publish fan-out: a=%d b=%d, want 1 each", len(a.mergedCalls), len(b.mergedCalls))
+	}
+
+	stateErr := multi.PublishState(context.Background(), StateSnapshot{
+		SchemaVersion: SnapshotSchemaVersion,
+		AreaState:     "WI",
+	})
+	if stateErr != nil {
+		t.Errorf("expected nil state error (no failure configured), got %v", stateErr)
+	}
+	if len(a.stateCalls) != 1 || len(b.stateCalls) != 1 {
+		t.Errorf("PublishState fan-out: a=%d b=%d, want 1 each", len(a.stateCalls), len(b.stateCalls))
+	}
+}
+
+// TestPerStateKey asserts the key helper produces the canonical R2/file
+// path. Worker route handler matches against this exact shape, so any
+// change here must coordinate with worker/index.ts.
+func TestPerStateKey(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		state string
+		want  string
+	}{
+		{"WI", "active-events/WI.json"},
+		{"IL", "active-events/IL.json"},
+		{"MN", "active-events/MN.json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.state, func(t *testing.T) {
+			t.Parallel()
+			if got := PerStateKey(tc.state); got != tc.want {
+				t.Errorf("PerStateKey(%q) = %q, want %q", tc.state, got, tc.want)
+			}
+		})
+	}
+
+	// Prefix matters for R2 listing — keep it under the asserted constant.
+	if PerStateKeyPrefix != "active-events/" {
+		t.Errorf("PerStateKeyPrefix changed: got %q want %q", PerStateKeyPrefix, "active-events/")
+	}
+	// The merged file MUST live outside the per-state prefix so a
+	// `list({prefix: PerStateKeyPrefix})` doesn't accidentally include it.
+	if strings.HasPrefix(SnapshotKey, PerStateKeyPrefix) {
+		t.Errorf("SnapshotKey %q must not live under PerStateKeyPrefix %q — it would pollute list() results",
+			SnapshotKey, PerStateKeyPrefix)
+	}
+}
+
+// TestStateSnapshotJSON asserts the per-state wire contract:
+// - top-level `area_state` (singular) is a string, not an array
+// - `schema_version` and `alerts[]` keys match the merged shape
+// - merged-only fields like `areas` are NOT present
+func TestStateSnapshotJSON(t *testing.T) {
+	t.Parallel()
+
+	snap := StateSnapshot{
+		SchemaVersion: SnapshotSchemaVersion,
+		GeneratedAt:   time.Date(2026, 4, 17, 23, 46, 0, 0, time.UTC),
+		AreaState:     "WI",
+		AlertCount:    1,
+		Alerts: []store.ActiveAlertGeoJSON{
+			{
+				NWSID:     "urn:oid:2.49.0.1.840.0.test",
+				EventType: "Tornado Warning",
+				States:    []string{"WI"},
+			},
+		},
+	}
+
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("marshaling state snapshot: %v", err)
+	}
+
+	var decoded struct {
+		SchemaVersion int    `json:"schema_version"`
+		AreaState     string `json:"area_state"`
+		AlertCount    int    `json:"alert_count"`
+		Alerts        []struct {
+			States []string `json:"states"`
+		} `json:"alerts"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshaling state snapshot: %v", err)
+	}
+
+	if decoded.SchemaVersion != SnapshotSchemaVersion {
+		t.Errorf("schema_version: got %d want %d", decoded.SchemaVersion, SnapshotSchemaVersion)
+	}
+	if decoded.AreaState != "WI" {
+		t.Errorf("area_state: got %q want %q", decoded.AreaState, "WI")
+	}
+	if len(decoded.Alerts) != 1 || len(decoded.Alerts[0].States) != 1 || decoded.Alerts[0].States[0] != "WI" {
+		t.Errorf("alerts[0].states: got %v want [WI]", decoded.Alerts[0].States)
+	}
+
+	// Per-state file must NOT publish merged-only fields. If `areas` shows
+	// up here, the client gets a confusing dual-shape payload.
+	if strings.Contains(string(raw), `"areas":`) {
+		t.Errorf("per-state snapshot must not include `areas`, got:\n%s", raw)
 	}
 }
 
