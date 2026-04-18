@@ -38,11 +38,20 @@ func TestFilterAlertsByState(t *testing.T) {
 		t.Run(tc.state, func(t *testing.T) {
 			t.Parallel()
 			got := filterAlertsByState(all, tc.state)
+
+			// Wire-format invariant: filterAlertsByState MUST return a non-nil
+			// slice even when no alerts match. The per-state snapshot has no
+			// `omitempty` on Alerts, so a nil here would marshal to
+			// `"alerts":null` — silently breaks the v2 contract that promises
+			// an array. Empty must be `[]`.
+			if got == nil {
+				t.Fatalf("filterAlertsByState(%q) returned nil — must return non-nil empty slice for v2 wire-format contract", tc.state)
+			}
+
 			gotIDs := make([]string, len(got))
 			for i, x := range got {
 				gotIDs[i] = x.NWSID
 			}
-			// Compare lengths first for cleaner failures.
 			if len(gotIDs) == 0 && len(tc.want) == 0 {
 				return
 			}

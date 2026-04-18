@@ -84,13 +84,12 @@ func (p *R2) Publish(ctx context.Context, snapshot Snapshot) error {
 		cacheControl string
 	}{
 		// Live snapshot — 30s cache aligns to the 30s ingest cadence, so
-		// edges hit R2 at most once per PoP per cycle. Worker overrides
-		// with the same value via LIVE_CACHE_CONTROL — keep them in sync
-		// so the ingest write and the worker response don't disagree on
-		// freshness contract.
-		{SnapshotKey, "public, max-age=30, s-maxage=30"},
+		// edges hit R2 at most once per PoP per cycle. Same constant used
+		// by the per-state PublishState path AND the worker's
+		// LIVE_CACHE_CONTROL — drift here breaks freshness debugging.
+		{SnapshotKey, CacheControlLive},
 		// Historical snapshot — immutable once written, cache for a year.
-		{historyKey, "public, max-age=31536000, immutable"},
+		{historyKey, CacheControlHistory},
 	}
 
 	for _, t := range targets {
@@ -140,8 +139,9 @@ func (p *R2) PublishState(ctx context.Context, snapshot StateSnapshot) error {
 		Body:        bytes.NewReader(data),
 		ContentType: aws.String("application/json; charset=utf-8"),
 		// Same 30s contract as the merged file — worker LIVE_CACHE_CONTROL
-		// covers both routes uniformly.
-		CacheControl: aws.String("public, max-age=30, s-maxage=30"),
+		// covers both routes uniformly. Use the shared constant so a future
+		// cadence change touches one symbol.
+		CacheControl: aws.String(CacheControlLive),
 	})
 	if err != nil {
 		return fmt.Errorf("r2 put %s/%s: %w", p.bucket, key, err)

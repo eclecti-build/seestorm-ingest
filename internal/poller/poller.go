@@ -150,6 +150,12 @@ func (p *Poller) pollStormReports(ctx context.Context) int {
 	return count
 }
 
+// publishTimeout is the per-call deadline for a single Publish or
+// PublishState invocation. Bounds the worst case so a single hung R2 PUT
+// can't block the rest of the cycle. Generous vs. typical R2 PUT latency
+// (sub-second) but well below the 30s polling interval.
+const publishTimeout = 5 * time.Second
+
 func (p *Poller) publishSnapshot(ctx context.Context) {
 	alerts, err := p.cfg.Store.GetActiveAlerts(ctx)
 	if err != nil {
@@ -170,9 +176,9 @@ func (p *Poller) publishSnapshot(ctx context.Context) {
 		AlertCount:    len(alerts),
 		Alerts:        alerts,
 	}
-	if err := p.cfg.Publisher.Publish(ctx, snapshot); err != nil {
-		slog.ErrorContext(ctx, "failed to publish merged snapshot", "error", err)
-	}
+	p.publishWithTimeout(ctx, "merged", "", func(timeoutCtx context.Context) error {
+		return p.cfg.Publisher.Publish(timeoutCtx, snapshot)
+	})
 
 	// Per-state snapshots — one per configured area, written to
 	// active-events/<STATE>.json. Cross-border alerts (states ⊃ {STATE})
@@ -190,12 +196,26 @@ func (p *Poller) publishSnapshot(ctx context.Context) {
 			AlertCount:    len(filtered),
 			Alerts:        filtered,
 		}
-		if err := p.cfg.Publisher.PublishState(ctx, stateSnapshot); err != nil {
-			slog.ErrorContext(ctx, "failed to publish state snapshot",
-				"state", state,
-				"error", err,
-			)
+		p.publishWithTimeout(ctx, "state", state, func(timeoutCtx context.Context) error {
+			return p.cfg.Publisher.PublishState(timeoutCtx, stateSnapshot)
+		})
+	}
+}
+
+// publishWithTimeout wraps a single publish call in a bounded deadline so
+// one hung destination (typically an R2 PUT during a Cloudflare degradation)
+// can't starve the rest of the publish fan-out. Logs failures with kind +
+// state context for triage; never returns an error because publish failures
+// are non-fatal for the polling loop (next cycle in 30s will overwrite).
+func (p *Poller) publishWithTimeout(parent context.Context, kind, state string, fn func(context.Context) error) {
+	ctx, cancel := context.WithTimeout(parent, publishTimeout)
+	defer cancel()
+	if err := fn(ctx); err != nil {
+		attrs := []any{"kind", kind, "error", err}
+		if state != "" {
+			attrs = append(attrs, "state", state)
 		}
+		slog.ErrorContext(parent, "publish failed", attrs...)
 	}
 }
 

@@ -15,6 +15,20 @@ import (
 // snapshot. Changing it is a breaking change for the public Worker allowlist.
 const SnapshotKey = "active-events.json"
 
+// CacheControlLive is the Cache-Control header value for live snapshots
+// (merged AND per-state files). Aligned to the 30s ingest cadence so the
+// edge serves at most one R2 GET per PoP per cycle.
+//
+// MUST match the worker's LIVE_CACHE_CONTROL constant — when these drift,
+// R2 declares one freshness contract and the worker declares another, which
+// confuses CDN debugging and surfaces as inconsistent caching behavior.
+// Centralized here so a future cadence change touches one symbol.
+const CacheControlLive = "public, max-age=30, s-maxage=30"
+
+// CacheControlHistory is the Cache-Control header value for archived
+// history snapshots (immutable once written, year-long cache).
+const CacheControlHistory = "public, max-age=31536000, immutable"
+
 // PerStateKeyPrefix is the R2 prefix (and filesystem subdirectory) for
 // per-state snapshots. Choosing a subdirectory rather than a flat suffix
 // (`active-events-WI.json`) keeps per-state listing trivially clean:

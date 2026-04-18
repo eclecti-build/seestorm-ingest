@@ -143,34 +143,66 @@ func (s *stubPublisher) PublishState(_ context.Context, snap StateSnapshot) erro
 // every registered destination, even when one fails. This is the contract
 // that lets us add R2 next to the local file publisher without coupling
 // failures (an R2 hiccup must not silence the on-disk debug snapshot).
+//
+// Both methods exercise the failure path independently — a regression in
+// either fan-out's first-error-wins behavior should trip exactly one
+// sub-test, making the failure point obvious.
 func TestMultiFanOutBoth(t *testing.T) {
 	t.Parallel()
 
-	a := &stubPublisher{}
-	b := &stubPublisher{failMerged: errors.New("R2 boom")}
-	multi := NewMulti(a, b)
+	t.Run("Publish fans out and surfaces first error", func(t *testing.T) {
+		t.Parallel()
+		a := &stubPublisher{}
+		b := &stubPublisher{failMerged: errors.New("R2 merged boom")}
+		multi := NewMulti(a, b)
 
-	mergedErr := multi.Publish(context.Background(), Snapshot{
-		SchemaVersion: SnapshotSchemaVersion,
-		Areas:         []string{"WI"},
+		err := multi.Publish(context.Background(), Snapshot{
+			SchemaVersion: SnapshotSchemaVersion,
+			Areas:         []string{"WI"},
+		})
+		if err == nil {
+			t.Fatalf("expected first error to surface, got nil")
+		}
+		if len(a.mergedCalls) != 1 || len(b.mergedCalls) != 1 {
+			t.Errorf("Publish fan-out: a=%d b=%d, want 1 each", len(a.mergedCalls), len(b.mergedCalls))
+		}
 	})
-	if mergedErr == nil {
-		t.Errorf("expected first error to surface, got nil")
-	}
-	if len(a.mergedCalls) != 1 || len(b.mergedCalls) != 1 {
-		t.Errorf("Publish fan-out: a=%d b=%d, want 1 each", len(a.mergedCalls), len(b.mergedCalls))
-	}
 
-	stateErr := multi.PublishState(context.Background(), StateSnapshot{
-		SchemaVersion: SnapshotSchemaVersion,
-		AreaState:     "WI",
+	t.Run("PublishState fans out and surfaces first error", func(t *testing.T) {
+		t.Parallel()
+		a := &stubPublisher{}
+		b := &stubPublisher{failState: errors.New("R2 per-state boom")}
+		multi := NewMulti(a, b)
+
+		err := multi.PublishState(context.Background(), StateSnapshot{
+			SchemaVersion: SnapshotSchemaVersion,
+			AreaState:     "WI",
+		})
+		if err == nil {
+			t.Fatalf("expected first error to surface, got nil")
+		}
+		if len(a.stateCalls) != 1 || len(b.stateCalls) != 1 {
+			t.Errorf("PublishState fan-out: a=%d b=%d, want 1 each", len(a.stateCalls), len(b.stateCalls))
+		}
 	})
-	if stateErr != nil {
-		t.Errorf("expected nil state error (no failure configured), got %v", stateErr)
-	}
-	if len(a.stateCalls) != 1 || len(b.stateCalls) != 1 {
-		t.Errorf("PublishState fan-out: a=%d b=%d, want 1 each", len(a.stateCalls), len(b.stateCalls))
-	}
+
+	t.Run("PublishState succeeds when no destination fails", func(t *testing.T) {
+		t.Parallel()
+		a := &stubPublisher{}
+		b := &stubPublisher{}
+		multi := NewMulti(a, b)
+
+		err := multi.PublishState(context.Background(), StateSnapshot{
+			SchemaVersion: SnapshotSchemaVersion,
+			AreaState:     "WI",
+		})
+		if err != nil {
+			t.Errorf("expected nil error on all-success path, got %v", err)
+		}
+		if len(a.stateCalls) != 1 || len(b.stateCalls) != 1 {
+			t.Errorf("PublishState fan-out: a=%d b=%d, want 1 each", len(a.stateCalls), len(b.stateCalls))
+		}
+	})
 }
 
 // TestPerStateKey asserts the key helper produces the canonical R2/file
