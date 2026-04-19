@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/eclecti-build/seestorm-ingest/internal/config"
 	"github.com/eclecti-build/seestorm-ingest/internal/nws"
 	"github.com/eclecti-build/seestorm-ingest/internal/publisher"
 	"github.com/eclecti-build/seestorm-ingest/internal/spc"
@@ -73,8 +74,17 @@ func (p *Poller) Run(ctx context.Context) error {
 	}
 }
 
-func (p *Poller) poll(ctx context.Context) {
+func (p *Poller) poll(pollCtx context.Context) {
 	start := time.Now()
+
+	// Scope the whole cycle under a per-cycle deadline. Without this, a slow
+	// upstream (NWS under load, SPC hung socket) can stretch a single cycle
+	// past the 30s interval, cause a parade of "poll cycle missed" warnings,
+	// and — under outbreak load — hold pool connections long enough to
+	// starve the next cycle. PollCycleTimeoutSec is deliberately < the
+	// 30s interval so we always relinquish before the next tick fires.
+	ctx, cancel := context.WithTimeout(pollCtx, config.PollCycleTimeoutSec*time.Second)
+	defer cancel()
 
 	// Fetch NWS alerts
 	alertCount := p.pollAlerts(ctx)
@@ -97,20 +107,24 @@ func (p *Poller) pollAlerts(ctx context.Context) int {
 	// polling is one request rather than N. See nws.FetchActiveAlerts docs.
 	alerts, err := p.cfg.NWS.FetchActiveAlerts(ctx, strings.Join(p.cfg.Areas, ","))
 	if err != nil {
-		slog.Error("failed to fetch alerts", "error", err)
+		slog.ErrorContext(ctx, "failed to fetch alerts", "error", err)
 		return 0
 	}
 
-	count := 0
-	for _, alert := range alerts.Features {
-		if err := p.cfg.Store.UpsertAlert(ctx, alert); err != nil {
-			slog.Error("failed to upsert alert",
-				"nws_id", alert.Properties.ID,
-				"error", err,
-			)
-			continue
-		}
-		count++
+	// Batch upsert — whole-cycle round-trip count drops from O(n) per-alert
+	// statements to one transactional batch, keeping us under
+	// PollCycleTimeoutSec under outbreak load. On tx failure the Store falls
+	// back to per-alert inserts and logs degraded_path=batch_upsert_fallback.
+	count, degraded, err := p.cfg.Store.UpsertAlertsBatch(ctx, alerts.Features)
+	if err != nil {
+		slog.ErrorContext(ctx, "failed to batch-upsert alerts", "error", err)
+		return count
+	}
+	if degraded {
+		slog.WarnContext(ctx, "alerts upserted via fallback path",
+			"count", count,
+			"total", len(alerts.Features),
+		)
 	}
 
 	return count
@@ -119,32 +133,37 @@ func (p *Poller) pollAlerts(ctx context.Context) int {
 func (p *Poller) pollStormReports(ctx context.Context) int {
 	reports, err := p.cfg.SPC.FetchTodayTornadoReports(ctx)
 	if err != nil {
-		slog.Error("failed to fetch tornado reports", "error", err)
-		return 0
+		slog.ErrorContext(ctx, "failed to fetch tornado reports", "error", err)
+		// A tornado-feed failure shouldn't kill hail + wind ingest — keep going.
+		reports = nil
 	}
 
 	// Also fetch hail and wind
 	hailReports, err := p.cfg.SPC.FetchTodayHailReports(ctx)
 	if err != nil {
-		slog.Error("failed to fetch hail reports", "error", err)
+		slog.ErrorContext(ctx, "failed to fetch hail reports", "error", err)
 	} else {
 		reports = append(reports, hailReports...)
 	}
 
 	windReports, err := p.cfg.SPC.FetchTodayWindReports(ctx)
 	if err != nil {
-		slog.Error("failed to fetch wind reports", "error", err)
+		slog.ErrorContext(ctx, "failed to fetch wind reports", "error", err)
 	} else {
 		reports = append(reports, windReports...)
 	}
 
-	count := 0
-	for _, report := range reports {
-		if err := p.cfg.Store.UpsertStormReport(ctx, report); err != nil {
-			slog.Error("failed to upsert storm report", "error", err)
-			continue
-		}
-		count++
+	// Batch upsert — see pollAlerts comment. Same tx-first / fallback shape.
+	count, degraded, err := p.cfg.Store.UpsertStormReportsBatch(ctx, reports)
+	if err != nil {
+		slog.ErrorContext(ctx, "failed to batch-upsert storm reports", "error", err)
+		return count
+	}
+	if degraded {
+		slog.WarnContext(ctx, "storm reports upserted via fallback path",
+			"count", count,
+			"total", len(reports),
+		)
 	}
 
 	return count
@@ -163,19 +182,16 @@ func (p *Poller) publishSnapshot(ctx context.Context) {
 		return
 	}
 
-	// Use a single timestamp across the merged + per-state snapshots so
-	// clients merging in-memory don't see split-time payloads.
-	generatedAt := time.Now().UTC()
+	// Build the merged snapshot first so the per-state siblings can reuse
+	// its GeneratedAt — NewSnapshot derives both generated_at and
+	// generated_at_ms from a single time.Now().UTC() call so the RFC3339 and
+	// epoch-ms fields can't drift sub-second. The client's staleness check
+	// depends on them agreeing, and merging clients that read both the
+	// merged file and a per-state sibling must see the same instant.
+	snapshot := publisher.NewSnapshot(p.cfg.Areas, alerts)
 
 	// Merged snapshot — the back-compat path and the "view all" UX. Goes
 	// through the publisher's history archival as well.
-	snapshot := publisher.Snapshot{
-		SchemaVersion: publisher.SnapshotSchemaVersion,
-		GeneratedAt:   generatedAt,
-		Areas:         p.cfg.Areas,
-		AlertCount:    len(alerts),
-		Alerts:        alerts,
-	}
 	p.publishWithTimeout(ctx, "merged", "", func(timeoutCtx context.Context) error {
 		return p.cfg.Publisher.Publish(timeoutCtx, snapshot)
 	})
@@ -189,13 +205,7 @@ func (p *Poller) publishSnapshot(ctx context.Context) {
 	// degrades gracefully for upstream payloads we can't classify.
 	for _, state := range p.cfg.Areas {
 		filtered := filterAlertsByState(alerts, state)
-		stateSnapshot := publisher.StateSnapshot{
-			SchemaVersion: publisher.SnapshotSchemaVersion,
-			GeneratedAt:   generatedAt,
-			AreaState:     state,
-			AlertCount:    len(filtered),
-			Alerts:        filtered,
-		}
+		stateSnapshot := publisher.NewStateSnapshot(state, filtered, snapshot.GeneratedAt)
 		p.publishWithTimeout(ctx, "state", state, func(timeoutCtx context.Context) error {
 			return p.cfg.Publisher.PublishState(timeoutCtx, stateSnapshot)
 		})

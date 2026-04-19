@@ -60,9 +60,24 @@ const SnapshotSchemaVersion = 2
 
 // Snapshot is the merged multi-state CDN-cacheable JSON published after each
 // poll cycle. Written to SnapshotKey (`active-events.json`).
+//
+// GeneratedAtMs is a redundant epoch-ms representation of GeneratedAt. The
+// client staleness check (Open Decisions #11 — red banner at 90s) diffs it
+// against serverNow() without parsing RFC3339, which is what keeps the
+// staleness calculation robust to client-clock skew. Both timestamp fields
+// MUST be populated from the same time.Now().UTC() call per cycle — drift
+// between them would cause the client to see phantom staleness or mask a
+// real stall. The poller wires this in publishSnapshot: one `now`, fanned
+// out to the merged Snapshot AND every per-state StateSnapshot so clients
+// merging in-memory don't see split-time payloads either.
+//
+// Old clients that predate the field ignore unknown JSON keys and stay on
+// the RFC3339 `generated_at` field, so this is a safe additive change to
+// the v2 envelope (no schema_version bump required).
 type Snapshot struct {
 	SchemaVersion int                        `json:"schema_version"`
 	GeneratedAt   time.Time                  `json:"generated_at"`
+	GeneratedAtMs int64                      `json:"generated_at_ms"`
 	Areas         []string                   `json:"areas"`
 	AlertCount    int                        `json:"alert_count"`
 	Alerts        []store.ActiveAlertGeoJSON `json:"alerts"`
@@ -79,12 +94,56 @@ type Snapshot struct {
 // (e.g. an alert with `states: ["WI","IL"]`) appear in BOTH `WI.json` and
 // `IL.json` — natural semantics for an alert whose footprint touches
 // multiple states.
+//
+// GeneratedAtMs mirrors Snapshot.GeneratedAtMs and MUST be populated from the
+// same time.Time as the merged Snapshot (and every sibling per-state file) in
+// a given poll cycle. Use NewSnapshot + NewStateSnapshot to enforce this.
 type StateSnapshot struct {
 	SchemaVersion int                        `json:"schema_version"`
 	GeneratedAt   time.Time                  `json:"generated_at"`
+	GeneratedAtMs int64                      `json:"generated_at_ms"`
 	AreaState     string                     `json:"area_state"`
 	AlertCount    int                        `json:"alert_count"`
 	Alerts        []store.ActiveAlertGeoJSON `json:"alerts"`
+}
+
+// NewSnapshot builds a merged Snapshot with both generated_at and
+// generated_at_ms derived from a single time.Now().UTC() call. Callers must
+// pass the returned Snapshot's GeneratedAt to NewStateSnapshot for every
+// per-state sibling so the whole fan-out carries one timestamp.
+func NewSnapshot(areas []string, alerts []store.ActiveAlertGeoJSON) Snapshot {
+	if alerts == nil {
+		alerts = []store.ActiveAlertGeoJSON{}
+	}
+	now := time.Now().UTC()
+	return Snapshot{
+		SchemaVersion: SnapshotSchemaVersion,
+		GeneratedAt:   now,
+		GeneratedAtMs: now.UnixMilli(),
+		Areas:         areas,
+		AlertCount:    len(alerts),
+		Alerts:        alerts,
+	}
+}
+
+// NewStateSnapshot builds a per-state slice that shares the merged snapshot's
+// timestamp. Takes `at` explicitly (rather than calling time.Now) so the
+// merged file and every per-state sibling carry the exact same
+// generated_at / generated_at_ms — the invariant the client's staleness
+// check relies on.
+func NewStateSnapshot(state string, alerts []store.ActiveAlertGeoJSON, at time.Time) StateSnapshot {
+	if alerts == nil {
+		alerts = []store.ActiveAlertGeoJSON{}
+	}
+	at = at.UTC()
+	return StateSnapshot{
+		SchemaVersion: SnapshotSchemaVersion,
+		GeneratedAt:   at,
+		GeneratedAtMs: at.UnixMilli(),
+		AreaState:     state,
+		AlertCount:    len(alerts),
+		Alerts:        alerts,
+	}
 }
 
 // Publisher writes snapshots somewhere durable and reachable.

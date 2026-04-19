@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/eclecti-build/seestorm-ingest/internal/nws"
@@ -20,7 +21,12 @@ type Store struct {
 }
 
 func New(ctx context.Context, databaseURL string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
+	cfg, err := buildPoolConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to database: %w", err)
 	}
@@ -30,6 +36,34 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 	}
 
 	return &Store{pool: pool}, nil
+}
+
+// buildPoolConfig parses the database URL and applies the audit-settled pool
+// shape (see docs/SWARM_AUDIT_2026-04-18.md "Constants — paste-ready"). Split
+// out so unit tests can assert the values without a live database.
+//
+// Sizing rationale:
+//   - MaxConns 16 stays under Neon Launch's default ceiling while leaving
+//     headroom for Atlas migrations running alongside the poller.
+//   - MinConns 2 keeps a warm pool so the first poll after idle-suspend
+//     doesn't pay a cold-connect penalty.
+//   - MaxConnIdleTime 4m is deliberately shorter than Neon's ~5m idle-suspend
+//     so pgx recycles before the server drops us.
+//   - statement_timeout 5s guards against a single query holding a connection
+//     through the whole PollCycleTimeoutSec window.
+func buildPoolConfig(databaseURL string) (*pgxpool.Config, error) {
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parsing database URL: %w", err)
+	}
+
+	cfg.MaxConns = 16
+	cfg.MinConns = 2
+	cfg.MaxConnIdleTime = 4 * time.Minute
+	cfg.MaxConnLifetime = 30 * time.Minute
+	cfg.ConnConfig.RuntimeParams["statement_timeout"] = "5000" // ms
+
+	return cfg, nil
 }
 
 func (s *Store) Close() {
@@ -80,6 +114,199 @@ func (s *Store) UpsertAlert(ctx context.Context, alert nws.Alert) error {
 	}
 
 	return nil
+}
+
+// UpsertAlertsBatch writes every alert in a single transaction using pgx.Batch,
+// and falls back to per-alert inserts if the batch transaction fails so one
+// malformed alert doesn't cost us 19 good ones in the same cycle. See audit
+// Open Decisions #8 (whole-batch transaction first; degraded path logged).
+//
+// Returns (inserted, degraded, err). `inserted` counts successful upserts;
+// `degraded` is true iff we took the per-alert fallback path. `err` is only
+// non-nil for ctx cancellation — individual row failures are logged and skipped.
+func (s *Store) UpsertAlertsBatch(ctx context.Context, alerts []nws.Alert) (int, bool, error) {
+	if len(alerts) == 0 {
+		return 0, false, nil
+	}
+
+	// Happy path: single transaction, all-or-nothing for the commit itself.
+	inserted, err := s.upsertAlertsBatchTx(ctx, alerts)
+	if err == nil {
+		return inserted, false, nil
+	}
+	if ctx.Err() != nil {
+		return 0, false, ctx.Err()
+	}
+
+	// Degraded path: the batch/tx failed (likely one malformed row poisoned
+	// the commit). Fall back to per-alert inserts so the good alerts still
+	// land. Logged explicitly so ops can tell the two paths apart.
+	slog.WarnContext(ctx, "batch upsert failed, falling back to per-alert",
+		"degraded_path", "batch_upsert_fallback",
+		"alert_count", len(alerts),
+		"error", err,
+	)
+
+	count := 0
+	for _, alert := range alerts {
+		if err := s.UpsertAlert(ctx, alert); err != nil {
+			slog.ErrorContext(ctx, "failed to upsert alert (fallback)",
+				"nws_id", alert.Properties.ID,
+				"error", err,
+			)
+			continue
+		}
+		count++
+	}
+	return count, true, nil
+}
+
+// upsertAlertsBatchTx runs the whole batch inside a single transaction. A
+// failure anywhere in Exec() results rolls the entire batch back — the caller
+// is expected to fall back to per-row inserts on error.
+func (s *Store) upsertAlertsBatchTx(ctx context.Context, alerts []nws.Alert) (int, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	// Safe to call after a successful Commit — pgx makes Rollback a no-op
+	// once the tx is committed, which keeps the defer simple.
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	batch := &pgx.Batch{}
+	for _, alert := range alerts {
+		args, err := alertUpsertArgs(alert)
+		if err != nil {
+			// A marshal failure pre-queue is a data-shape bug, not a DB
+			// issue. Abort the batch so the caller can drop into the
+			// per-row fallback path where the bad row's error is isolated.
+			return 0, fmt.Errorf("marshaling alert %s: %w", alert.Properties.ID, err)
+		}
+		batch.Queue(upsertAlertSQL, args...)
+	}
+
+	br := tx.SendBatch(ctx, batch)
+	var batchErr error
+	for range alerts {
+		if _, err := br.Exec(); err != nil && batchErr == nil {
+			batchErr = err
+		}
+	}
+	if closeErr := br.Close(); closeErr != nil && batchErr == nil {
+		batchErr = closeErr
+	}
+	if batchErr != nil {
+		return 0, fmt.Errorf("batch exec: %w", batchErr)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit tx: %w", err)
+	}
+	return len(alerts), nil
+}
+
+// alertUpsertArgs extracts the parameter list for a single alert upsert.
+// Shared by the per-row path and the batch path so the argument order stays
+// in lockstep with upsertAlertSQL.
+func alertUpsertArgs(alert nws.Alert) ([]any, error) {
+	props := alert.Properties
+
+	propsJSON, err := json.Marshal(props)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling properties: %w", err)
+	}
+
+	var geomStr *string
+	if len(alert.Geometry) > 0 && string(alert.Geometry) != "null" {
+		s := string(alert.Geometry)
+		geomStr = &s
+	}
+
+	effectiveAt, _ := time.Parse(time.RFC3339, props.Effective)
+	expiresAt, _ := time.Parse(time.RFC3339, props.Expires)
+
+	return []any{
+		props.ID,
+		props.Event,
+		props.Severity,
+		props.Headline,
+		props.Description,
+		props.Instruction,
+		props.AreaDesc,
+		props.SenderName,
+		geomStr,
+		propsJSON,
+		effectiveAt,
+		expiresAt,
+	}, nil
+}
+
+// UpsertStormReportsBatch writes every storm report in a single transaction
+// via pgx.Batch, falling back to per-report inserts on failure. Same shape as
+// UpsertAlertsBatch — see that doc comment for semantics.
+func (s *Store) UpsertStormReportsBatch(ctx context.Context, reports []spc.StormReport) (int, bool, error) {
+	if len(reports) == 0 {
+		return 0, false, nil
+	}
+
+	inserted, err := s.upsertStormReportsBatchTx(ctx, reports)
+	if err == nil {
+		return inserted, false, nil
+	}
+	if ctx.Err() != nil {
+		return 0, false, ctx.Err()
+	}
+
+	slog.WarnContext(ctx, "batch upsert failed, falling back to per-report",
+		"degraded_path", "batch_upsert_fallback",
+		"report_count", len(reports),
+		"error", err,
+	)
+
+	count := 0
+	for _, report := range reports {
+		if err := s.UpsertStormReport(ctx, report); err != nil {
+			slog.ErrorContext(ctx, "failed to upsert storm report (fallback)", "error", err)
+			continue
+		}
+		count++
+	}
+	return count, true, nil
+}
+
+func (s *Store) upsertStormReportsBatchTx(ctx context.Context, reports []spc.StormReport) (int, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	batch := &pgx.Batch{}
+	for _, r := range reports {
+		batch.Queue(upsertStormReportSQL,
+			r.Type, r.Magnitude, r.Location, r.County, r.State, r.Comments,
+			r.Lon, r.Lat, r.Time,
+		)
+	}
+
+	br := tx.SendBatch(ctx, batch)
+	var batchErr error
+	for range reports {
+		if _, err := br.Exec(); err != nil && batchErr == nil {
+			batchErr = err
+		}
+	}
+	if closeErr := br.Close(); closeErr != nil && batchErr == nil {
+		batchErr = closeErr
+	}
+	if batchErr != nil {
+		return 0, fmt.Errorf("batch exec: %w", batchErr)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit tx: %w", err)
+	}
+	return len(reports), nil
 }
 
 func (s *Store) UpsertStormReport(ctx context.Context, report spc.StormReport) error {
