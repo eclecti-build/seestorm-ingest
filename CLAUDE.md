@@ -30,7 +30,7 @@ See `Makefile` for the full target list.
 - `ent/migrate/migrations/` — Atlas-managed migration SQL
 
 ## Data Flow
-1. Poll NWS alerts API every 30s for active alerts in the configured `NWS_AREA`(s) — accepts a single state code or a comma-separated list (e.g. `WI` or `MN,WI,IL,IN,MI,OH,PA,NY`).
+1. Poll NWS alerts API every 30s for active alerts in the configured `NWS_AREA`(s) — accepts a single state code or a comma-separated list (e.g. `WI` or `MN,WI,IL,IN,MI,OH,PA,NY,IA`).
 2. Poll SPC CSVs for today's storm reports
 3. Deduplicate and upsert to PostGIS
 4. Publish `active-events.json` snapshot to local disk and Cloudflare R2

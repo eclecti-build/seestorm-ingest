@@ -23,7 +23,7 @@ go run ./cmd/ingest
 | `DATABASE_URL` | (required) | PostgreSQL connection string |
 | `SNAPSHOT_DIR` | `./snapshots` | Directory for JSON snapshot output |
 | `POLL_INTERVAL` | `30s` | Polling interval (Go duration format) |
-| `NWS_AREA` | `WI` | USPS state code(s) to poll. Accepts a single value (`WI`) or comma-separated list (`MN,WI,IL,IN,MI,OH,PA,NY`). One HTTP request regardless of list length. |
+| `NWS_AREA` | `WI` | USPS state code(s) to poll. Accepts a single value (`WI`) or comma-separated list (`MN,WI,IL,IN,MI,OH,PA,NY,IA`). One HTTP request regardless of list length. |
 
 ## Architecture
 

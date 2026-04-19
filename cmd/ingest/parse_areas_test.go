@@ -35,8 +35,8 @@ func TestParseAreas(t *testing.T) {
 		},
 		{
 			name: "great lakes basin",
-			raw:  "MN,WI,IL,IN,MI,OH,PA,NY",
-			want: []string{"MN", "WI", "IL", "IN", "MI", "OH", "PA", "NY"},
+			raw:  "MN,WI,IL,IN,MI,OH,PA,NY,IA",
+			want: []string{"MN", "WI", "IL", "IN", "MI", "OH", "PA", "NY", "IA"},
 		},
 		{
 			name: "tolerates spaces around commas",
