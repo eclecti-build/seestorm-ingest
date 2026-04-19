@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -15,6 +16,15 @@ import (
 	"github.com/eclecti-build/seestorm-ingest/internal/nws"
 	"github.com/eclecti-build/seestorm-ingest/internal/spc"
 )
+
+// isFatalBatchErr reports whether a batch-level error should short-circuit
+// the per-row fallback path. Context errors (cancel/deadline) mean the whole
+// cycle is already giving up — iterating per-row would issue O(n) doomed
+// statements against the same unhealthy ctx and end with a silent
+// degraded-path "success" that drops the tail. Treat those as fatal.
+func isFatalBatchErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
 
 type Store struct {
 	pool *pgxpool.Pool
@@ -50,7 +60,10 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 //   - MaxConnIdleTime 4m is deliberately shorter than Neon's ~5m idle-suspend
 //     so pgx recycles before the server drops us.
 //   - statement_timeout 5s guards against a single query holding a connection
-//     through the whole PollCycleTimeoutSec window.
+//     through the whole PollCycleTimeoutSec window. Migrate() overrides this
+//     with SET LOCAL statement_timeout = 0 inside its transaction so boot-time
+//     DDL (CREATE EXTENSION postgis on cold Neon, future CREATE INDEX on a
+//     populated table) isn't aborted by the hot-path ceiling.
 func buildPoolConfig(databaseURL string) (*pgxpool.Config, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
@@ -70,10 +83,32 @@ func (s *Store) Close() {
 	s.pool.Close()
 }
 
+// Migrate runs schema DDL inside an explicit transaction and disables
+// statement_timeout for that transaction only. The shared pool bakes in
+// statement_timeout=5000 (see buildPoolConfig) to bound hot-path queries,
+// but DDL during boot — CREATE EXTENSION postgis on a cold Neon branch,
+// CREATE INDEX on a populated table, future PostGIS additions — can easily
+// run past 5s and would otherwise fail the process on startup. SET LOCAL
+// scopes the override to this transaction so non-migrate pool checkouts
+// still inherit the 5s ceiling.
 func (s *Store) Migrate(ctx context.Context) error {
-	_, err := s.pool.Exec(ctx, migrateSQL)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
+		return fmt.Errorf("begin migrate tx: %w", err)
+	}
+	// Safe to call after Commit — pgx makes Rollback a no-op once committed.
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = 0"); err != nil {
+		return fmt.Errorf("disabling statement_timeout for migrate: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, migrateSQL); err != nil {
 		return fmt.Errorf("running migrations: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit migrate tx: %w", err)
 	}
 	return nil
 }
@@ -134,6 +169,13 @@ func (s *Store) UpsertAlertsBatch(ctx context.Context, alerts []nws.Alert) (int,
 	if err == nil {
 		return inserted, false, nil
 	}
+	// Distinguish ctx/infra failure from data-shape failure. Context errors
+	// mean the cycle deadline fired or shutdown is in progress — retrying
+	// per-row against the same dead ctx just burns cycles and silently drops
+	// rows. Surface the ctx error instead of entering the fallback loop.
+	if isFatalBatchErr(err) {
+		return 0, false, err
+	}
 	if ctx.Err() != nil {
 		return 0, false, ctx.Err()
 	}
@@ -150,6 +192,13 @@ func (s *Store) UpsertAlertsBatch(ctx context.Context, alerts []nws.Alert) (int,
 	count := 0
 	for _, alert := range alerts {
 		if err := s.UpsertAlert(ctx, alert); err != nil {
+			// If the ctx died mid-fallback (cycle deadline fired,
+			// shutdown signal), stop iterating and surface the error.
+			// Continuing would log O(remaining) identical failures and
+			// still end with degraded=true, which is worse than bailing.
+			if isFatalBatchErr(err) {
+				return count, true, err
+			}
 			slog.ErrorContext(ctx, "failed to upsert alert (fallback)",
 				"nws_id", alert.Properties.ID,
 				"error", err,
@@ -253,6 +302,11 @@ func (s *Store) UpsertStormReportsBatch(ctx context.Context, reports []spc.Storm
 	if err == nil {
 		return inserted, false, nil
 	}
+	// See UpsertAlertsBatch for the rationale — ctx errors should short-circuit
+	// the fallback, not fan out into O(n) doomed per-row retries.
+	if isFatalBatchErr(err) {
+		return 0, false, err
+	}
 	if ctx.Err() != nil {
 		return 0, false, ctx.Err()
 	}
@@ -266,6 +320,9 @@ func (s *Store) UpsertStormReportsBatch(ctx context.Context, reports []spc.Storm
 	count := 0
 	for _, report := range reports {
 		if err := s.UpsertStormReport(ctx, report); err != nil {
+			if isFatalBatchErr(err) {
+				return count, true, err
+			}
 			slog.ErrorContext(ctx, "failed to upsert storm report (fallback)", "error", err)
 			continue
 		}
