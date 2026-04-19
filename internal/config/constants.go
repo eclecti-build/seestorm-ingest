@@ -21,8 +21,12 @@ const (
 	// Great Lakes basin can cross several MB of GeoJSON. The 15s cap was sized
 	// for the single-state (WI-only) payload shape the audit was written
 	// against; 30s is the load-driven ceiling from the multi-state work.
-	// Still well below PollCycleTimeoutSec so the cycle deadline remains the
-	// binding constraint on slow upstreams.
+	//
+	// Higher than PollCycleTimeoutSec (25s) by design — the cycle context
+	// fires first and cancels the in-flight request, so this timeout is the
+	// slow-network ceiling only, not the binding constraint. Left generous
+	// so an HTTP-level abort reads as "cycle gave up" in traces rather than
+	// two racing deadlines firing near-simultaneously.
 	HTTPClientTimeoutSec = 30 // per-request timeout on upstream NWS/SPC
 
 	RetentionDays       = 30

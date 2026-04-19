@@ -74,16 +74,49 @@ func (p *Poller) Run(ctx context.Context) error {
 	}
 }
 
+// cycleSlack is the tail we reserve inside each PollInterval for publish +
+// bookkeeping after the derived cycle ctx fires. Keeps the "timeout < interval"
+// invariant robust even if the operator picks an unusual PollInterval.
+const cycleSlack = 5 * time.Second
+
+// cycleFloor is the minimum cycle timeout we'll ever apply. Prevents the
+// derived timeout from collapsing to zero if PollInterval is ever set below
+// cycleSlack (misconfig or aggressive test setup).
+const cycleFloor = 1 * time.Second
+
+// deriveCycleTimeout returns the per-cycle context timeout given the
+// configured PollInterval. Logic:
+//   - Clamp at PollCycleTimeoutSec (the fixed ceiling baked into the audit).
+//   - Never exceed PollInterval - cycleSlack, so publish/slack always fits
+//     inside the interval and the next tick isn't starved.
+//   - Never drop below cycleFloor, guarding misconfigured tiny intervals.
+//
+// This preserves the audit-settled 25s ceiling for the normal 30s interval
+// while making the invariant "cycle timeout < interval" hold for any
+// PollInterval the operator picks.
+func deriveCycleTimeout(interval time.Duration) time.Duration {
+	ceiling := time.Duration(config.PollCycleTimeoutSec) * time.Second
+	derived := interval - cycleSlack
+	if derived > ceiling {
+		derived = ceiling
+	}
+	if derived < cycleFloor {
+		derived = cycleFloor
+	}
+	return derived
+}
+
 func (p *Poller) poll(pollCtx context.Context) {
 	start := time.Now()
 
 	// Scope the whole cycle under a per-cycle deadline. Without this, a slow
 	// upstream (NWS under load, SPC hung socket) can stretch a single cycle
-	// past the 30s interval, cause a parade of "poll cycle missed" warnings,
+	// past the interval, cause a parade of "poll cycle missed" warnings,
 	// and — under outbreak load — hold pool connections long enough to
-	// starve the next cycle. PollCycleTimeoutSec is deliberately < the
-	// 30s interval so we always relinquish before the next tick fires.
-	ctx, cancel := context.WithTimeout(pollCtx, config.PollCycleTimeoutSec*time.Second)
+	// starve the next cycle. The timeout is derived from PollInterval so
+	// the "cycle timeout < interval" invariant holds for any operator-set
+	// interval, not just the default 30s. See deriveCycleTimeout.
+	ctx, cancel := context.WithTimeout(pollCtx, deriveCycleTimeout(p.cfg.PollInterval))
 	defer cancel()
 
 	// Fetch NWS alerts
