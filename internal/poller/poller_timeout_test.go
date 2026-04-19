@@ -78,3 +78,122 @@ func TestDeriveCycleTimeout_RespectsIntervalInvariant(t *testing.T) {
 		})
 	}
 }
+
+// TestSplitCycleBudget_GuaranteesPublishBudget locks in the core invariant
+// behind Codex C3: the publish phase always gets PublishPhaseBudgetSec (5s)
+// of its own budget, no matter how tight the overall cycle timeout is or how
+// slow the fetch+store phase was. fetchStoreBudget is the remainder, floored
+// at 1s for safety when cycleTimeout is pathologically small.
+//
+// The invariant we really care about:
+//   - publishBudget is ALWAYS exactly PublishPhaseBudgetSec seconds.
+//   - fetchStoreBudget is always >= 1s.
+//   - Under normal (non-pathological) cycleTimeout values, the two sum to
+//     cycleTimeout; under tiny values the floor takes over and total may
+//     exceed cycleTimeout — that's fine because the outer pollCtx timeout
+//     and sequential phase execution still bound total wall-clock.
+func TestSplitCycleBudget_GuaranteesPublishBudget(t *testing.T) {
+	t.Parallel()
+
+	publish := time.Duration(config.PublishPhaseBudgetSec) * time.Second
+
+	cases := []struct {
+		name             string
+		cycleTimeout     time.Duration
+		wantFetchStore   time.Duration
+		wantPublish      time.Duration
+		wantSumEqTimeout bool
+	}{
+		{
+			name:             "default 25s cycle splits to 20s fetch+store / 5s publish",
+			cycleTimeout:     25 * time.Second,
+			wantFetchStore:   20 * time.Second,
+			wantPublish:      publish,
+			wantSumEqTimeout: true,
+		},
+		{
+			name:             "15s cycle (20s interval) splits to 10s / 5s",
+			cycleTimeout:     15 * time.Second,
+			wantFetchStore:   10 * time.Second,
+			wantPublish:      publish,
+			wantSumEqTimeout: true,
+		},
+		{
+			name:             "6s cycle splits to 1s / 5s",
+			cycleTimeout:     6 * time.Second,
+			wantFetchStore:   1 * time.Second,
+			wantPublish:      publish,
+			wantSumEqTimeout: true,
+		},
+		{
+			name:             "5s cycle hits fetch+store floor — publish still gets full 5s",
+			cycleTimeout:     5 * time.Second,
+			wantFetchStore:   1 * time.Second,
+			wantPublish:      publish,
+			wantSumEqTimeout: false, // floor overrides subtraction
+		},
+		{
+			name:             "1s cycleFloor hits fetch+store floor — publish still gets full 5s",
+			cycleTimeout:     1 * time.Second,
+			wantFetchStore:   1 * time.Second,
+			wantPublish:      publish,
+			wantSumEqTimeout: false,
+		},
+		{
+			name:             "zero cycleTimeout hits fetch+store floor — publish still gets full 5s",
+			cycleTimeout:     0,
+			wantFetchStore:   1 * time.Second,
+			wantPublish:      publish,
+			wantSumEqTimeout: false,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gotFetchStore, gotPublish := splitCycleBudget(tc.cycleTimeout)
+			if gotFetchStore != tc.wantFetchStore {
+				t.Errorf("fetchStoreBudget = %v, want %v", gotFetchStore, tc.wantFetchStore)
+			}
+			if gotPublish != tc.wantPublish {
+				t.Errorf("publishBudget = %v, want %v", gotPublish, tc.wantPublish)
+			}
+			// Core invariant — publish ALWAYS gets the full configured budget,
+			// and fetch+store is never less than 1s. This is the fix for C3.
+			if gotPublish != publish {
+				t.Errorf("publishBudget must ALWAYS equal PublishPhaseBudgetSec (%v), got %v", publish, gotPublish)
+			}
+			if gotFetchStore < time.Second {
+				t.Errorf("fetchStoreBudget must be >= 1s floor, got %v", gotFetchStore)
+			}
+			if tc.wantSumEqTimeout {
+				if sum := gotFetchStore + gotPublish; sum != tc.cycleTimeout {
+					t.Errorf("fetchStore+publish = %v, want %v (cycleTimeout)", sum, tc.cycleTimeout)
+				}
+			}
+		})
+	}
+}
+
+// TestSplitCycleBudget_DefaultCycleMatchesAuditNumbers pins the concrete
+// budget numbers under the default operator config (30s PollInterval → 25s
+// cycleTimeout → 20s fetch+store / 5s publish). These are the numbers
+// referenced in incident playbooks and the Codex C3 review; if someone
+// changes them they should do it deliberately, not incidentally.
+func TestSplitCycleBudget_DefaultCycleMatchesAuditNumbers(t *testing.T) {
+	t.Parallel()
+
+	cycleTimeout := deriveCycleTimeout(time.Duration(config.PollIntervalSec) * time.Second)
+	if cycleTimeout != 25*time.Second {
+		t.Fatalf("derived cycle timeout for 30s interval = %v, want 25s (audit-settled ceiling)", cycleTimeout)
+	}
+
+	fetchStore, publish := splitCycleBudget(cycleTimeout)
+	if fetchStore != 20*time.Second {
+		t.Errorf("fetchStoreBudget for default cycle = %v, want 20s", fetchStore)
+	}
+	if publish != 5*time.Second {
+		t.Errorf("publishBudget for default cycle = %v, want 5s", publish)
+	}
+}
