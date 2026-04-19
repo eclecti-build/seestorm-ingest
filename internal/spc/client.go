@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/eclecti-build/seestorm-ingest/internal/config"
 )
 
 type Client struct {
@@ -19,7 +21,7 @@ type Client struct {
 func NewClient() *Client {
 	return &Client{
 		httpClient: &http.Client{
-			Timeout: 15 * time.Second,
+			Timeout: config.HTTPClientTimeoutSec * time.Second,
 		},
 		baseURL: "https://www.spc.noaa.gov/climo/reports",
 	}
@@ -58,7 +60,10 @@ func (c *Client) fetchReports(ctx context.Context, file string, reportType strin
 		return nil, fmt.Errorf("SPC returned %d for %s", resp.StatusCode, file)
 	}
 
-	return parseCSVReports(resp.Body, reportType)
+	// Cap upstream body size before parsing. Prevents a runaway CSV from
+	// exhausting memory; csv.Reader sees io.EOF at the cap and the caller
+	// handles the partial-read error without wedging the pool.
+	return parseCSVReports(io.LimitReader(resp.Body, config.SPCResponseMaxBytes), reportType)
 }
 
 func parseCSVReports(r io.Reader, reportType string) ([]StormReport, error) {

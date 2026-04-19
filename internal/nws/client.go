@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/eclecti-build/seestorm-ingest/internal/config"
 )
 
 type Client struct {
@@ -19,10 +21,12 @@ type Client struct {
 func NewClient(userAgent string) *Client {
 	return &Client{
 		httpClient: &http.Client{
-			// 30s accommodates outbreak-day payloads when polling many states
-			// in a single request (e.g. an 8-state Great Lakes pull during a
-			// multi-state derecho can return several MB of GeoJSON).
-			Timeout: 30 * time.Second,
+			// config.HTTPClientTimeoutSec is 30s, sized to accommodate outbreak-day
+			// payloads when polling many states in a single request (e.g. an
+			// 8-state Great Lakes pull during a multi-state derecho can return
+			// several MB of GeoJSON). See config/constants.go for the rationale
+			// behind the deviation from the audit's single-state default.
+			Timeout: config.HTTPClientTimeoutSec * time.Second,
 		},
 		userAgent: userAgent,
 		baseURL:   "https://api.weather.gov",
@@ -60,8 +64,14 @@ func (c *Client) FetchActiveAlerts(ctx context.Context, area string) (*AlertsRes
 		return nil, fmt.Errorf("NWS API returned %d: %s", resp.StatusCode, string(body))
 	}
 
+	// Cap upstream body size before decoding. A runaway or malicious NWS
+	// response shouldn't be able to exhaust memory or stall the poll cycle
+	// — the LimitReader returns EOF once the cap is hit, which json.Decode
+	// surfaces as an unexpected-EOF error the cycle can log and recover from.
+	limited := io.LimitReader(resp.Body, config.NWSResponseMaxBytes)
+
 	var alerts AlertsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&alerts); err != nil {
+	if err := json.NewDecoder(limited).Decode(&alerts); err != nil {
 		return nil, fmt.Errorf("decoding alerts: %w", err)
 	}
 
