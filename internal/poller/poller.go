@@ -106,6 +106,53 @@ func deriveCycleTimeout(interval time.Duration) time.Duration {
 	return derived
 }
 
+// splitCycleBudget divides the per-cycle wall-clock budget into a fetch+store
+// phase budget and a separate publish-phase budget. The publish phase is
+// guaranteed PublishPhaseBudgetSec (5s) regardless of how long fetch+store
+// took, so a slow NWS/SPC or Postgres batch can never starve publish. The
+// floor (1s for fetch+store) guards against pathological tiny cycleTimeout
+// values — the split function never returns a non-positive fetch+store
+// budget.
+//
+// The two phases run sequentially inside a single pollCtx.WithTimeout(…,
+// cycleTimeout), so total wall-clock is still bounded by cycleTimeout; this
+// function only controls how that budget is apportioned between phases.
+//
+// See Codex review C3: without the split, a fetch/store that consumed ~all
+// of cycleTimeout left publishSnapshot with <1s, causing it to fail to write
+// the R2 snapshot even after alerts had landed in Postgres — clients saw
+// stale data despite fresh DB state.
+func splitCycleBudget(cycleTimeout time.Duration) (fetchStoreBudget, publishBudget time.Duration) {
+	publishBudget = time.Duration(config.PublishPhaseBudgetSec) * time.Second
+	fetchStoreBudget = cycleTimeout - publishBudget
+	if fetchStoreBudget < time.Second {
+		fetchStoreBudget = time.Second
+	}
+	return fetchStoreBudget, publishBudget
+}
+
+// poll runs one polling cycle. The cycle runs under a derived cycleTimeout
+// (see deriveCycleTimeout) that's split into two sequential phases with
+// SEPARATE deadlines both derived from pollCtx:
+//
+//  1. fetch+store phase — pollAlerts + pollStormReports, bounded at
+//     cycleTimeout - publishBudget.
+//  2. publish phase — publishSnapshot, bounded at publishBudget (fixed 5s).
+//
+// The phases share pollCtx as parent, so caller-level cancellation
+// propagates to both. Critically, the publish phase gets its own fresh
+// deadline regardless of how long fetch+store took — a slow upstream fetch
+// or a slow batch upsert cannot starve publish and leave the R2 snapshot
+// stale while Postgres already has the fresh data.
+//
+// Total wall-clock for one cycle is bounded by cycleTimeout for any
+// operator-reachable PollInterval (default 30s → 25s cycleTimeout →
+// 20s + 5s = 25s total). The phases run sequentially, so their budgets
+// sum rather than overlap. In pathological configs where cycleTimeout is
+// below PublishPhaseBudgetSec + fetchStoreFloor (1s) — only reachable with
+// sub-6s PollInterval values — we intentionally favor publish getting its
+// full 5s over strict cycleTimeout adherence, since a 1s interval is
+// already a misconfig. See splitCycleBudget and Codex review C3.
 func (p *Poller) poll(pollCtx context.Context) {
 	start := time.Now()
 
@@ -116,22 +163,32 @@ func (p *Poller) poll(pollCtx context.Context) {
 	// starve the next cycle. The timeout is derived from PollInterval so
 	// the "cycle timeout < interval" invariant holds for any operator-set
 	// interval, not just the default 30s. See deriveCycleTimeout.
-	ctx, cancel := context.WithTimeout(pollCtx, deriveCycleTimeout(p.cfg.PollInterval))
-	defer cancel()
+	cycleTimeout := deriveCycleTimeout(p.cfg.PollInterval)
+	fetchStoreBudget, publishBudget := splitCycleBudget(cycleTimeout)
 
-	// Fetch NWS alerts
-	alertCount := p.pollAlerts(ctx)
+	// Fetch+store phase: bounded so a slow NWS/SPC can't consume the whole
+	// cycle budget. When this context expires, in-flight fetches/upserts are
+	// cancelled but the publish phase below still gets its own fresh budget.
+	fetchStoreCtx, fetchStoreCancel := context.WithTimeout(pollCtx, fetchStoreBudget)
+	alertCount := p.pollAlerts(fetchStoreCtx)
+	reportCount := p.pollStormReports(fetchStoreCtx)
+	fetchStoreCancel()
 
-	// Fetch SPC storm reports
-	reportCount := p.pollStormReports(ctx)
-
-	// Publish snapshot
-	p.publishSnapshot(ctx)
+	// Publish phase: independent deadline derived from pollCtx, not from the
+	// (possibly nearly-exhausted) fetchStoreCtx. This is the fix for Codex
+	// C3 — a cycle where fetch/store consumed ~all its budget previously
+	// left publish with <1s and the R2 snapshot went stale.
+	publishCtx, publishCancel := context.WithTimeout(pollCtx, publishBudget)
+	defer publishCancel()
+	p.publishSnapshot(publishCtx)
 
 	slog.Info("poll cycle complete",
 		"alerts_processed", alertCount,
 		"reports_processed", reportCount,
 		"duration", time.Since(start),
+		"cycle_timeout", cycleTimeout,
+		"fetch_store_budget", fetchStoreBudget,
+		"publish_budget", publishBudget,
 	)
 }
 

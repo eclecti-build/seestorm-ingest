@@ -12,6 +12,15 @@ const (
 	PollIntervalSec     = 30
 	PollCycleTimeoutSec = 25 // context.WithTimeout wrapper for each poll cycle
 
+	// PublishPhaseBudgetSec is the guaranteed budget reserved for the publish
+	// phase inside each poll cycle. The cycle context is split into a
+	// fetch+store phase (cycleTimeout - PublishPhaseBudgetSec) and a separate
+	// publish phase (PublishPhaseBudgetSec) so a slow upstream fetch can't
+	// starve publish of time to push a fresh snapshot to R2. Total wall-clock
+	// bound is unchanged — the two phases run sequentially within cycleTimeout.
+	// See poller.splitCycleBudget and Codex review C3.
+	PublishPhaseBudgetSec = 5
+
 	NWSResponseMaxBytes = 32 * 1024 * 1024 // io.LimitReader cap
 	SPCResponseMaxBytes = 4 * 1024 * 1024  // io.LimitReader cap
 
