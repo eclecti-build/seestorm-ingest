@@ -79,18 +79,18 @@ func TestDeriveCycleTimeout_RespectsIntervalInvariant(t *testing.T) {
 	}
 }
 
-// TestSplitCycleBudget_GuaranteesPublishBudget locks in the core invariant
-// behind Codex C3: the publish phase always gets PublishPhaseBudgetSec (15s)
-// of its own budget, no matter how tight the overall cycle timeout is or how
-// slow the fetch+store phase was. fetchStoreBudget is the remainder, floored
-// at 1s for safety when cycleTimeout is pathologically small.
+// TestSplitCycleBudget_GuaranteesPublishBudget locks in the core invariants
+// behind Codex C3 and the 2026-04-21 follow-up:
 //
-// The invariant we really care about:
-//   - publishBudget is ALWAYS exactly PublishPhaseBudgetSec seconds.
-//   - fetchStoreBudget is always >= 1s.
-//   - Under normal (non-pathological) cycleTimeout values, the two sum to
-//     cycleTimeout; under tiny values the floor takes over and total may
-//     exceed cycleTimeout — that's fine because the outer pollCtx timeout
+//   - publishBudget gets the full PublishPhaseBudgetSec whenever cycleTimeout
+//     can fit it alongside the 1s fetch+store floor.
+//   - When cycleTimeout is too small to fit both, publish is capped at
+//     cycleTimeout - 1s so the two phases still fit sequentially. This
+//     prevents silently-dropped cycles on operator-set short intervals
+//     after the 5s -> 15s publish-budget bump.
+//   - Both phases are always >= 1s (floor).
+//   - Under pathological cycleTimeout (< 2s) both floors engage and the sum
+//     may exceed cycleTimeout — that's fine because the outer pollCtx timeout
 //     and sequential phase execution still bound total wall-clock.
 func TestSplitCycleBudget_GuaranteesPublishBudget(t *testing.T) {
 	t.Parallel()
@@ -119,31 +119,45 @@ func TestSplitCycleBudget_GuaranteesPublishBudget(t *testing.T) {
 			wantSumEqTimeout: true,
 		},
 		{
-			name:             "16s cycle splits to 1s / 15s",
+			name:             "16s cycle splits to 1s / 15s (publish at floor of fit)",
 			cycleTimeout:     16 * time.Second,
 			wantFetchStore:   1 * time.Second,
 			wantPublish:      publish,
 			wantSumEqTimeout: true,
 		},
 		{
-			name:             "15s cycle hits fetch+store floor — publish still gets full budget",
-			cycleTimeout:     15 * time.Second,
+			name:             "10s cycle caps publish at cycleTimeout - 1s so phases fit",
+			cycleTimeout:     10 * time.Second,
 			wantFetchStore:   1 * time.Second,
-			wantPublish:      publish,
-			wantSumEqTimeout: false, // floor overrides subtraction
+			wantPublish:      9 * time.Second,
+			wantSumEqTimeout: true,
 		},
 		{
-			name:             "1s cycleFloor hits fetch+store floor — publish still gets full budget",
+			name:             "5s cycle caps publish at cycleTimeout - 1s so phases fit",
+			cycleTimeout:     5 * time.Second,
+			wantFetchStore:   1 * time.Second,
+			wantPublish:      4 * time.Second,
+			wantSumEqTimeout: true,
+		},
+		{
+			name:             "2s cycle caps publish at 1s (both at floor, sum == cycle)",
+			cycleTimeout:     2 * time.Second,
+			wantFetchStore:   1 * time.Second,
+			wantPublish:      1 * time.Second,
+			wantSumEqTimeout: true,
+		},
+		{
+			name:             "1s cycleFloor — both phases at 1s floor, sum > cycle (pathological)",
 			cycleTimeout:     1 * time.Second,
 			wantFetchStore:   1 * time.Second,
-			wantPublish:      publish,
+			wantPublish:      1 * time.Second,
 			wantSumEqTimeout: false,
 		},
 		{
-			name:             "zero cycleTimeout hits fetch+store floor — publish still gets full budget",
+			name:             "zero cycleTimeout — both phases at 1s floor (pathological)",
 			cycleTimeout:     0,
 			wantFetchStore:   1 * time.Second,
-			wantPublish:      publish,
+			wantPublish:      1 * time.Second,
 			wantSumEqTimeout: false,
 		},
 	}
@@ -159,13 +173,25 @@ func TestSplitCycleBudget_GuaranteesPublishBudget(t *testing.T) {
 			if gotPublish != tc.wantPublish {
 				t.Errorf("publishBudget = %v, want %v", gotPublish, tc.wantPublish)
 			}
-			// Core invariant — publish ALWAYS gets the full configured budget,
-			// and fetch+store is never less than 1s. This is the fix for C3.
-			if gotPublish != publish {
-				t.Errorf("publishBudget must ALWAYS equal PublishPhaseBudgetSec (%v), got %v", publish, gotPublish)
+			// Core invariants:
+			//   - publish never exceeds the configured PublishPhaseBudgetSec
+			//   - publish and fetch+store are each >= 1s floor
+			//   - when cycleTimeout >= 2s, the two phases fit back-to-back
+			//     inside cycleTimeout (sum <= cycleTimeout). This is the
+			//     interval-headroom invariant caught by the 2026-04-21 review.
+			if gotPublish > publish {
+				t.Errorf("publishBudget %v exceeds PublishPhaseBudgetSec ceiling %v", gotPublish, publish)
+			}
+			if gotPublish < time.Second {
+				t.Errorf("publishBudget must be >= 1s floor, got %v", gotPublish)
 			}
 			if gotFetchStore < time.Second {
 				t.Errorf("fetchStoreBudget must be >= 1s floor, got %v", gotFetchStore)
+			}
+			if tc.cycleTimeout >= 2*time.Second {
+				if sum := gotFetchStore + gotPublish; sum > tc.cycleTimeout {
+					t.Errorf("fetchStore+publish = %v must fit inside cycleTimeout %v", sum, tc.cycleTimeout)
+				}
 			}
 			if tc.wantSumEqTimeout {
 				if sum := gotFetchStore + gotPublish; sum != tc.cycleTimeout {

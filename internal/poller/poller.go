@@ -107,26 +107,36 @@ func deriveCycleTimeout(interval time.Duration) time.Duration {
 }
 
 // splitCycleBudget divides the per-cycle wall-clock budget into a fetch+store
-// phase budget and a separate publish-phase budget. The publish phase is
-// guaranteed PublishPhaseBudgetSec (15s) regardless of how long fetch+store
-// took, so a slow NWS/SPC or Postgres batch can never starve publish. The
-// floor (1s for fetch+store) guards against pathological tiny cycleTimeout
-// values — the split function never returns a non-positive fetch+store
-// budget.
+// phase budget and a separate publish-phase budget. The publish phase aims
+// for PublishPhaseBudgetSec (15s) regardless of how long fetch+store took,
+// so a slow NWS/SPC or Postgres batch can never starve publish. A 1s floor
+// per phase guards against pathological tiny cycleTimeout values.
 //
 // The two phases run sequentially inside a single pollCtx.WithTimeout(…,
 // cycleTimeout), so total wall-clock is still bounded by cycleTimeout; this
 // function only controls how that budget is apportioned between phases.
 //
-// See Codex review C3: without the split, a fetch/store that consumed ~all
-// of cycleTimeout left publishSnapshot with <1s, causing it to fail to write
-// the R2 snapshot even after alerts had landed in Postgres — clients saw
-// stale data despite fresh DB state.
+// When cycleTimeout is smaller than PublishPhaseBudgetSec + the 1s fetch+store
+// floor (e.g. an operator-set POLL_INTERVAL that derives a short cycleTimeout),
+// publish is capped at cycleTimeout - 1s so the two phases actually fit
+// sequentially. Without the cap, the outer pollCtx cancels publish mid-flight
+// and the cycle is silently dropped.
+//
+// See Codex review C3 (publish starvation) and the 2026-04-21 follow-up
+// review which caught the interval-headroom regression when we raised
+// PublishPhaseBudgetSec from 5s to 15s.
 func splitCycleBudget(cycleTimeout time.Duration) (fetchStoreBudget, publishBudget time.Duration) {
+	const phaseFloor = time.Second
 	publishBudget = time.Duration(config.PublishPhaseBudgetSec) * time.Second
+	if maxPublish := cycleTimeout - phaseFloor; publishBudget > maxPublish {
+		publishBudget = maxPublish
+	}
+	if publishBudget < phaseFloor {
+		publishBudget = phaseFloor
+	}
 	fetchStoreBudget = cycleTimeout - publishBudget
-	if fetchStoreBudget < time.Second {
-		fetchStoreBudget = time.Second
+	if fetchStoreBudget < phaseFloor {
+		fetchStoreBudget = phaseFloor
 	}
 	return fetchStoreBudget, publishBudget
 }
