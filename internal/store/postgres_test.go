@@ -32,7 +32,7 @@ func TestBuildPoolConfig_AppliesAuditConstants(t *testing.T) {
 	if got, want := cfg.MaxConnLifetime, 30*time.Minute; got != want {
 		t.Errorf("MaxConnLifetime: got %v want %v", got, want)
 	}
-	if got, want := cfg.ConnConfig.RuntimeParams["statement_timeout"], "5000"; got != want {
+	if got, want := cfg.ConnConfig.RuntimeParams["statement_timeout"], "15000"; got != want {
 		t.Errorf("statement_timeout: got %q want %q", got, want)
 	}
 }

@@ -108,7 +108,7 @@ func deriveCycleTimeout(interval time.Duration) time.Duration {
 
 // splitCycleBudget divides the per-cycle wall-clock budget into a fetch+store
 // phase budget and a separate publish-phase budget. The publish phase is
-// guaranteed PublishPhaseBudgetSec (5s) regardless of how long fetch+store
+// guaranteed PublishPhaseBudgetSec (15s) regardless of how long fetch+store
 // took, so a slow NWS/SPC or Postgres batch can never starve publish. The
 // floor (1s for fetch+store) guards against pathological tiny cycleTimeout
 // values — the split function never returns a non-positive fetch+store
@@ -137,7 +137,7 @@ func splitCycleBudget(cycleTimeout time.Duration) (fetchStoreBudget, publishBudg
 //
 //  1. fetch+store phase — pollAlerts + pollStormReports, bounded at
 //     cycleTimeout - publishBudget.
-//  2. publish phase — publishSnapshot, bounded at publishBudget (fixed 5s).
+//  2. publish phase — publishSnapshot, bounded at publishBudget (fixed 15s).
 //
 // The phases share pollCtx as parent, so caller-level cancellation
 // propagates to both. Critically, the publish phase gets its own fresh

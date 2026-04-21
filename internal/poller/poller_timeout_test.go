@@ -80,7 +80,7 @@ func TestDeriveCycleTimeout_RespectsIntervalInvariant(t *testing.T) {
 }
 
 // TestSplitCycleBudget_GuaranteesPublishBudget locks in the core invariant
-// behind Codex C3: the publish phase always gets PublishPhaseBudgetSec (5s)
+// behind Codex C3: the publish phase always gets PublishPhaseBudgetSec (15s)
 // of its own budget, no matter how tight the overall cycle timeout is or how
 // slow the fetch+store phase was. fetchStoreBudget is the remainder, floored
 // at 1s for safety when cycleTimeout is pathologically small.
@@ -105,42 +105,42 @@ func TestSplitCycleBudget_GuaranteesPublishBudget(t *testing.T) {
 		wantSumEqTimeout bool
 	}{
 		{
-			name:             "default 25s cycle splits to 20s fetch+store / 5s publish",
+			name:             "default 25s cycle splits to 10s fetch+store / 15s publish",
 			cycleTimeout:     25 * time.Second,
-			wantFetchStore:   20 * time.Second,
-			wantPublish:      publish,
-			wantSumEqTimeout: true,
-		},
-		{
-			name:             "15s cycle (20s interval) splits to 10s / 5s",
-			cycleTimeout:     15 * time.Second,
 			wantFetchStore:   10 * time.Second,
 			wantPublish:      publish,
 			wantSumEqTimeout: true,
 		},
 		{
-			name:             "6s cycle splits to 1s / 5s",
-			cycleTimeout:     6 * time.Second,
+			name:             "30s cycle splits to 15s / 15s",
+			cycleTimeout:     30 * time.Second,
+			wantFetchStore:   15 * time.Second,
+			wantPublish:      publish,
+			wantSumEqTimeout: true,
+		},
+		{
+			name:             "16s cycle splits to 1s / 15s",
+			cycleTimeout:     16 * time.Second,
 			wantFetchStore:   1 * time.Second,
 			wantPublish:      publish,
 			wantSumEqTimeout: true,
 		},
 		{
-			name:             "5s cycle hits fetch+store floor — publish still gets full 5s",
-			cycleTimeout:     5 * time.Second,
+			name:             "15s cycle hits fetch+store floor — publish still gets full budget",
+			cycleTimeout:     15 * time.Second,
 			wantFetchStore:   1 * time.Second,
 			wantPublish:      publish,
 			wantSumEqTimeout: false, // floor overrides subtraction
 		},
 		{
-			name:             "1s cycleFloor hits fetch+store floor — publish still gets full 5s",
+			name:             "1s cycleFloor hits fetch+store floor — publish still gets full budget",
 			cycleTimeout:     1 * time.Second,
 			wantFetchStore:   1 * time.Second,
 			wantPublish:      publish,
 			wantSumEqTimeout: false,
 		},
 		{
-			name:             "zero cycleTimeout hits fetch+store floor — publish still gets full 5s",
+			name:             "zero cycleTimeout hits fetch+store floor — publish still gets full budget",
 			cycleTimeout:     0,
 			wantFetchStore:   1 * time.Second,
 			wantPublish:      publish,
@@ -178,9 +178,13 @@ func TestSplitCycleBudget_GuaranteesPublishBudget(t *testing.T) {
 
 // TestSplitCycleBudget_DefaultCycleMatchesAuditNumbers pins the concrete
 // budget numbers under the default operator config (30s PollInterval → 25s
-// cycleTimeout → 20s fetch+store / 5s publish). These are the numbers
+// cycleTimeout → 10s fetch+store / 15s publish). These are the numbers
 // referenced in incident playbooks and the Codex C3 review; if someone
 // changes them they should do it deliberately, not incidentally.
+//
+// Widened from the original 20/5 split on 2026-04-21 after an IA outbreak
+// where the 5s publish budget starved sequential R2 puts. See the
+// PublishPhaseBudgetSec comment in internal/config/constants.go.
 func TestSplitCycleBudget_DefaultCycleMatchesAuditNumbers(t *testing.T) {
 	t.Parallel()
 
@@ -190,10 +194,10 @@ func TestSplitCycleBudget_DefaultCycleMatchesAuditNumbers(t *testing.T) {
 	}
 
 	fetchStore, publish := splitCycleBudget(cycleTimeout)
-	if fetchStore != 20*time.Second {
-		t.Errorf("fetchStoreBudget for default cycle = %v, want 20s", fetchStore)
+	if fetchStore != 10*time.Second {
+		t.Errorf("fetchStoreBudget for default cycle = %v, want 10s", fetchStore)
 	}
-	if publish != 5*time.Second {
-		t.Errorf("publishBudget for default cycle = %v, want 5s", publish)
+	if publish != 15*time.Second {
+		t.Errorf("publishBudget for default cycle = %v, want 15s", publish)
 	}
 }

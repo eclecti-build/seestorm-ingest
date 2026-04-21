@@ -59,9 +59,11 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 //     doesn't pay a cold-connect penalty.
 //   - MaxConnIdleTime 4m is deliberately shorter than Neon's ~5m idle-suspend
 //     so pgx recycles before the server drops us.
-//   - statement_timeout 5s guards against a single query holding a connection
-//     through the whole PollCycleTimeoutSec window. Migrate() overrides this
-//     with SET LOCAL statement_timeout = 0 inside its transaction so boot-time
+//   - statement_timeout 15s guards against a single query holding a connection
+//     through the whole PollCycleTimeoutSec window. Raised from 5s after the
+//     2026-04-21 IA outbreak where GetActiveAlerts cursor iteration under
+//     heavy alert load tripped the 5s ceiling. Migrate() overrides this with
+//     SET LOCAL statement_timeout = 0 inside its transaction so boot-time
 //     DDL (CREATE EXTENSION postgis on cold Neon, future CREATE INDEX on a
 //     populated table) isn't aborted by the hot-path ceiling.
 func buildPoolConfig(databaseURL string) (*pgxpool.Config, error) {
@@ -74,7 +76,7 @@ func buildPoolConfig(databaseURL string) (*pgxpool.Config, error) {
 	cfg.MinConns = 2
 	cfg.MaxConnIdleTime = 4 * time.Minute
 	cfg.MaxConnLifetime = 30 * time.Minute
-	cfg.ConnConfig.RuntimeParams["statement_timeout"] = "5000" // ms
+	cfg.ConnConfig.RuntimeParams["statement_timeout"] = "15000" // ms
 
 	return cfg, nil
 }
@@ -85,7 +87,7 @@ func (s *Store) Close() {
 
 // Migrate runs schema DDL inside an explicit transaction and disables
 // statement_timeout for that transaction only. The shared pool bakes in
-// statement_timeout=5000 (see buildPoolConfig) to bound hot-path queries,
+// statement_timeout=15000 (see buildPoolConfig) to bound hot-path queries,
 // but DDL during boot — CREATE EXTENSION postgis on a cold Neon branch,
 // CREATE INDEX on a populated table, future PostGIS additions — can easily
 // run past 5s and would otherwise fail the process on startup. SET LOCAL

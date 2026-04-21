@@ -19,7 +19,14 @@ const (
 	// starve publish of time to push a fresh snapshot to R2. Total wall-clock
 	// bound is unchanged — the two phases run sequentially within cycleTimeout.
 	// See poller.splitCycleBudget and Codex review C3.
-	PublishPhaseBudgetSec = 5
+	//
+	// Sized at 15s (was 5s) after 2026-04-21 IA outbreak day: the phase runs
+	// a merged snapshot + 8 per-state R2 puts sequentially under a single
+	// shared context, so one slow R2 PutObject starves every later put. 15s
+	// gives ~1.6s average per put with headroom; the proper fix (per-put
+	// timeout + retry) is tracked separately. Fetch+store retains 10s, which
+	// observed cycles finish inside comfortably.
+	PublishPhaseBudgetSec = 15
 
 	NWSResponseMaxBytes = 32 * 1024 * 1024 // io.LimitReader cap
 	SPCResponseMaxBytes = 4 * 1024 * 1024  // io.LimitReader cap
