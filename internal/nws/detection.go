@@ -45,9 +45,11 @@
 //   - "Tornado Emergency" (CATASTROPHIC) is its own name, not a louder
 //     Tornado Warning.
 //
-// The TORNADO...POSSIBLE tag is intentionally NOT a detection level: it is
-// the embedded-tornado tag inside *Severe Thunderstorm* Warnings, not a
-// Tornado Warning, so it resolves to "no detection" rather than overclaim.
+// POSSIBLE — whether as the structured `tornadoDetection` parameter or the
+// `TORNADO...POSSIBLE` tag — is intentionally NOT a detection level: it is
+// the embedded-tornado signal of a *Severe Thunderstorm* Warning, not a
+// Tornado Warning. It is a KNOWN value that resolves to "no detection"
+// rather than overclaim, and is NOT treated as format drift.
 package nws
 
 import (
@@ -143,8 +145,19 @@ func DetectTornado(params map[string][]string, description string) (*TornadoDete
 		case "OBSERVED":
 			det.Detection = DetectionObserved
 			resolved = true
+		case "POSSIBLE":
+			// A KNOWN value, but not a Tornado Warning detection level:
+			// `tornadoDetection...POSSIBLE` is the embedded-tornado
+			// parameter of a *Severe Thunderstorm* Warning. Resolve to
+			// "no tornado detection" (leave unresolved → (nil, nil))
+			// rather than overclaim OR mistreat a known value as drift.
+			// Mirrors the Tier-2 tag path, which also drops POSSIBLE. SVR
+			// warnings with embedded tornado potential are common during
+			// an outbreak; erroring here would bury the detFailed drift
+			// signal under expected noise.
 		default:
-			// A present-but-unrecognized value is drift worth surfacing.
+			// A present-but-unrecognized value is genuine drift worth
+			// surfacing.
 			return nil, fmt.Errorf("parsing tornado detection: unrecognized tornadoDetection %q", raw)
 		}
 	}

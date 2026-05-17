@@ -121,6 +121,11 @@ func TestDetectTornado(t *testing.T) {
 			wantNil:     true,
 		},
 		{
+			name:    "tier 1: structured POSSIBLE (SVR embedded) is a known non-detection, not drift",
+			params:  map[string][]string{"tornadoDetection": {"POSSIBLE"}},
+			wantNil: true,
+		},
+		{
 			name:        "tier 3: conservative narrative yields RADAR_INDICATED only",
 			description: svsRadarIndicatedNarrative,
 			want: TornadoDetection{
