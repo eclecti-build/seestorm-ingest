@@ -407,6 +407,14 @@ type ActiveAlertGeoJSON struct {
 	ExpiresAt   time.Time        `json:"expires_at"`
 	StormMotion *nws.StormMotion `json:"storm_motion,omitempty"`
 	WarningTags *nws.WarningTags `json:"warning_tags,omitempty"`
+	// Tornado is the normalized detection axis (RADAR_INDICATED vs
+	// OBSERVED/confirmed) + damage threat. Additive optional field — its
+	// absence is the norm (non-tornado products). Derived at read time
+	// like StormMotion/WarningTags; carries NO snapshot schema bump
+	// because it is purely additive and forward-compatible (the client
+	// ignores unknown fields). See docs/TORNADO_DETECTION_CONTRACT.md in
+	// the umbrella repo for the cross-cutting contract.
+	Tornado *nws.TornadoDetection `json:"tornado,omitempty"`
 }
 
 // alertPropsParams is the minimal shape we unmarshal out of the JSONB
@@ -433,6 +441,9 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 		motionFailed   int
 		statesFromSAME int
 		statesFallback int
+		detRadar       int
+		detObserved    int
+		detFailed      int
 	)
 	for rows.Next() {
 		var a ActiveAlertGeoJSON
@@ -504,6 +515,30 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 			)
 		}
 		a.WarningTags = tags
+
+		// Resolve the tornado detection axis (RADAR_INDICATED vs
+		// OBSERVED/confirmed) + damage threat from structured params,
+		// then the `&&` tag block, then a conservative narrative scan.
+		// Like motion, this is optional — a parse failure (NWS value
+		// drift) logs and the alert still ships; a missed detection is
+		// a nil omitempty field, never a dropped alert.
+		detection, err := nws.DetectTornado(props.Parameters, a.Description)
+		switch {
+		case err != nil:
+			detFailed++
+			slog.WarnContext(ctx, "tornado detection parse failed",
+				"nws_id", a.NWSID,
+				"error", err,
+			)
+		case detection == nil:
+			// Not a tornado warning / no detection info — the norm.
+		case detection.Confirmed:
+			detObserved++
+		default:
+			detRadar++
+		}
+		a.Tornado = detection
+
 		alerts = append(alerts, a)
 	}
 	// pgx's rows.Next() returns false on both clean iteration end AND a
@@ -524,6 +559,12 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 	slog.InfoContext(ctx, "snapshot state derivation stats",
 		"from_same", statesFromSAME,
 		"from_area_desc_fallback", statesFallback,
+	)
+
+	slog.InfoContext(ctx, "snapshot tornado detection stats",
+		"radar_indicated", detRadar,
+		"observed", detObserved,
+		"failed", detFailed,
 	)
 
 	return alerts, nil
