@@ -42,7 +42,7 @@ import (
 type WarningTags struct {
 	// Tornado-warning tags
 	Tornado             string `json:"tornado,omitempty"`               // OBSERVED | POSSIBLE | RADAR INDICATED
-	TornadoDamageThreat string `json:"tornado_damage_threat,omitempty"` // CONSIDERABLE | DESTRUCTIVE | CATASTROPHIC
+	TornadoDamageThreat string `json:"tornado_damage_threat,omitempty"` // CONSIDERABLE | CATASTROPHIC (DESTRUCTIVE is a *thunderstorm* threat, not tornado)
 
 	// Severe-thunderstorm-warning tags
 	Hail                     string `json:"hail,omitempty"`                       // e.g. "1.75IN" or "<.75IN"
