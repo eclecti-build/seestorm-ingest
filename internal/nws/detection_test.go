@@ -146,6 +146,16 @@ func TestDetectTornado(t *testing.T) {
 			wantNil:     true,
 		},
 		{
+			name:        "tier 3 gating: SVR 'tornado possible' hazard must NOT become a detection",
+			description: "Severe thunderstorm.\n\nHAZARD...60 mph wind gusts and a tornado possible.\n\nSOURCE...Radar indicated.\n\nIMPACT...Damaging winds.",
+			wantNil:     true,
+		},
+		{
+			name:        "tier 2 drift: unknown TORNADO tag (no structured param) surfaces an error",
+			description: "Prose.\n\n&&\n\nTORNADO...SATELLITE DERIVED\n\n&&\n",
+			wantErr:     true,
+		},
+		{
 			name:    "drift: unrecognized structured tornadoDetection surfaces an error",
 			params:  map[string][]string{"tornadoDetection": {"SATELLITE DERIVED"}},
 			wantErr: true,

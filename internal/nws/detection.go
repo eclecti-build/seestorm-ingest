@@ -105,12 +105,33 @@ type TornadoDetection struct {
 	SourceText string `json:"source_text,omitempty"`
 }
 
-// hazardTornadoRe matches the SVS narrative hazard line that scopes a
-// statement to a tornado (e.g. "HAZARD...Tornado."). Tier-3 narrative
-// inference is gated on this so a Severe Thunderstorm / Flash Flood SVS
-// with a "SOURCE...Radar indicated" line can never be misread as a
-// tornado detection.
-var hazardTornadoRe = regexp.MustCompile(`(?i)\bHAZARD\.{2,}[^\n]*\btornado`)
+// hazardLineRe extracts the value of the SVS narrative HAZARD... line.
+var hazardLineRe = regexp.MustCompile(`(?i)\bHAZARD\.{2,}\s*([^\n]+)`)
+
+// svrHazardExclusionRe rejects a HAZARD value where the tornado is only a
+// *possibility* or is secondary to wind/hail — i.e. a Severe Thunderstorm
+// Warning's embedded-tornado wording ("...60 mph wind gusts and a tornado
+// possible"). Without this, the bare "mentions tornado" check let tier-3
+// narrate an SVR into a RADAR_INDICATED tornado — the exact overclaim the
+// fallback exists to prevent.
+var svrHazardExclusionRe = regexp.MustCompile(`(?i)\b(possible|wind|hail|mph|gust)\b`)
+
+// isTornadoHazard reports whether the SVS narrative HAZARD line scopes the
+// statement to an actual ongoing tornado (e.g. "HAZARD...Tornado.",
+// "HAZARD...Damaging tornado.") rather than merely mentioning a tornado as
+// possible or secondary in a Severe Thunderstorm Warning. Deliberately
+// strict: tier-3 is a last resort and under-claiming is the safe failure.
+func isTornadoHazard(description string) bool {
+	m := hazardLineRe.FindStringSubmatch(description)
+	if m == nil {
+		return false
+	}
+	haz := m[1]
+	if !strings.Contains(strings.ToLower(haz), "tornado") {
+		return false
+	}
+	return !svrHazardExclusionRe.MatchString(haz)
+}
 
 // sourceLineRe captures the value of the SVS narrative "SOURCE..." line up
 // to end-of-line. NWS canonically uses three dots; we accept two-or-more
@@ -180,12 +201,24 @@ func DetectTornado(params map[string][]string, description string) (*TornadoDete
 	if tags != nil {
 		if !resolved {
 			switch normalizeToken(tags.Tornado) {
+			case "":
+				// No TORNADO... tag on this warning (e.g. an SVR carrying
+				// only hail/wind tags). Not a detection, not drift.
 			case "RADAR INDICATED":
 				det.Detection = DetectionRadarIndicated
 				resolved = true
 			case "OBSERVED":
 				det.Detection = DetectionObserved
 				resolved = true
+			case "POSSIBLE":
+				// SVR embedded-tornado tag — a KNOWN non-detection,
+				// mirroring the structured Tier-1 POSSIBLE handling.
+			default:
+				// Symmetric with Tier-1: a non-empty, unrecognized tag
+				// value is genuine NWS format drift. Surface it so
+				// detFailed counts it instead of the detection silently
+				// vanishing (the documented return contract).
+				return nil, fmt.Errorf("parsing tornado detection: unrecognized TORNADO tag %q", tags.Tornado)
 			}
 		}
 		if det.DamageThreat == DamageThreatBase {
@@ -217,7 +250,7 @@ func DetectTornado(params map[string][]string, description string) (*TornadoDete
 	// HAZARD context, and ONLY in the under-claiming direction. A false
 	// "confirmed" is the dangerous failure mode; a missed confirmation
 	// degrades gracefully to "radar indicated".
-	if !resolved && hazardTornadoRe.MatchString(description) {
+	if !resolved && isTornadoHazard(description) {
 		if strings.Contains(strings.ToUpper(narrativeSource), "RADAR INDICATED") {
 			det.Detection = DetectionRadarIndicated
 			resolved = true
