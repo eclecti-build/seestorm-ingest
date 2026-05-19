@@ -1,0 +1,26 @@
+name: security
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: gitleaks (blocking)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.25' }
+      - name: govulncheck (blocking)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+      - name: trivy (report-only)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scanners: 'vuln,secret,misconfig'
+          exit-code: '0'
