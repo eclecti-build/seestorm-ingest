@@ -3,14 +3,14 @@ package store
 // migrateSQL is the authoritative schema definition for this service.
 //
 // At every startup, Store.Migrate executes this block inside an explicit
-// transaction. All statements use IF NOT EXISTS / IF EXISTS so the block is
+// transaction. All statements use CREATE ... IF NOT EXISTS so the block is
 // idempotent on an already-provisioned database. This is the actual mechanism
 // that creates and maintains the schema — not Ent or Atlas.
 //
 // Ent entity schemas (ent/schema/) and the Atlas configuration (atlas.hcl,
 // ent/migrate/migrations/) are scaffolded but not yet authoritative at
-// runtime; migrating to Atlas-managed declarative migrations is deferred
-// (tracked as DEF-014 in docs/FUTURE.md in the umbrella repo).
+// runtime; migrating to Atlas-managed declarative migrations is planned
+// future work (tracked in the project issue tracker).
 const migrateSQL = `
 CREATE EXTENSION IF NOT EXISTS postgis;
 

@@ -54,7 +54,7 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 //
 // Sizing rationale:
 //   - MaxConns 16 stays under Neon Launch's default ceiling while leaving
-//     headroom for future tooling (e.g. Atlas migrations when DEF-014 lands)
+//     headroom for future tooling (e.g. Atlas migrations when that work lands)
 //     running alongside the poller.
 //   - MinConns 2 keeps a warm pool so the first poll after idle-suspend
 //     doesn't pay a cold-connect penalty.
@@ -413,8 +413,8 @@ type ActiveAlertGeoJSON struct {
 	// absence is the norm (non-tornado products). Derived at read time
 	// like StormMotion/WarningTags; carries NO snapshot schema bump
 	// because it is purely additive and forward-compatible (the client
-	// ignores unknown fields). See docs/TORNADO_DETECTION_CONTRACT.md in
-	// the umbrella repo for the cross-cutting contract.
+	// ignores unknown fields). See docs/TORNADO_DETECTION_CONTRACT.md for
+	// the cross-cutting contract.
 	Tornado *nws.TornadoDetection `json:"tornado,omitempty"`
 }
 

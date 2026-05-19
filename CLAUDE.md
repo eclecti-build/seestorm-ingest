@@ -4,9 +4,8 @@ Go service that polls NWS/SPC APIs and archives weather events to PostGIS.
 
 ## Stack
 - **Language:** Go 1.25 (`go.mod` pins 1.25.5)
-- **Database driver:** `github.com/jackc/pgx/v5`
-- **Database driver (active):** `github.com/jackc/pgx/v5` — the service applies its schema via an idempotent embedded DDL block (`migrateSQL` in `internal/store/queries.go`) executed in-process at every boot
-- **ORM + migrations (scaffolded, not yet authoritative):** [Ent](https://entgo.io) with [Atlas](https://atlasgo.io) — entity schemas in `ent/schema/` and Atlas config (`atlas.hcl`) are present but have no effect at runtime; adoption is planned future work (DEF-014)
+- **Database driver:** `github.com/jackc/pgx/v5` — schema is applied via an idempotent embedded DDL block (`migrateSQL` in `internal/store/queries.go`) executed in-process at every boot
+- **ORM + migrations (scaffolded, not yet authoritative):** [Ent](https://entgo.io) with [Atlas](https://atlasgo.io) — entity schemas in `ent/schema/` and Atlas config (`atlas.hcl`) are present but have no effect at runtime; migrating to Atlas-managed migrations is planned future work (tracked in the project issue tracker)
 - **Database:** Neon Postgres + PostGIS
 - **Snapshot storage:** Cloudflare R2 (`active-events.json`)
 - **Deploy target:** Fly.io, primary region `ord` (Chicago — closest to Wisconsin)
@@ -43,7 +42,7 @@ when the wire shape changes and coordinate the client PR before deploying.
 ## Auth
 **None.** The ingest service exposes no authenticated endpoints today — its output (snapshot JSON on Cloudflare R2) is public by design. Public safety data stays frictionless.
 
-Future work may require auth for narrow use cases (user-submitted spotter reports, admin-only data corrections, rate-limiting abusive scrapers). Evaluate at the edge (Cloudflare WAF) before adding application-level auth. See `../seestorm/docs/FUTURE.md`.
+Future work may require auth for narrow use cases (user-submitted spotter reports, admin-only data corrections, rate-limiting abusive scrapers). Evaluate at the edge (Cloudflare WAF) before adding application-level auth.
 
 ## Testing
 - Standard Go `*_test.go` files, table-driven
@@ -78,11 +77,11 @@ Conventional Commits with these prefixes:
 
 `migrations/001_initial.sql` is a historical record of the hand-written initial schema — it is not executed at runtime and is kept for reference only.
 
-**Ent + Atlas (scaffolded, not yet active):** `ent/schema/` and `atlas.hcl` are present and wired up (see `Makefile` targets `generate`, `migrate-diff`, `migrate-apply`) but no entity schemas are defined yet, and Atlas has not generated any migrations. These artifacts have no effect on a running database. Migrating to Atlas-managed declarative migrations is planned future work (DEF-014).
+**Ent + Atlas (scaffolded, not yet active):** `ent/schema/` and `atlas.hcl` are present and wired up (see `Makefile` targets `generate`, `migrate-diff`, `migrate-apply`) but no entity schemas are defined yet, and Atlas has not generated any migrations. These artifacts have no effect on a running database. Migrating to Atlas-managed declarative migrations is planned future work (tracked in the project issue tracker).
 
-**To add a schema change today:** edit `migrateSQL` in `internal/store/queries.go`. Use `IF NOT EXISTS` / `IF NOT EXISTS` guards so the change is idempotent on existing databases.
+**To add a schema change today:** edit `migrateSQL` in `internal/store/queries.go`. Use `IF NOT EXISTS` guards so the DDL is idempotent on existing databases.
 
-**When Ent + Atlas adoption lands (DEF-014):**
+**When Ent + Atlas adoption lands:**
 
 1. Add an entity schema in `ent/schema/<name>.go` (must implement `ent.Schema`).
 2. `make generate` — regenerates the Ent client.
