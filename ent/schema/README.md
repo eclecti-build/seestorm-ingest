@@ -29,6 +29,12 @@ Additionally set `ATLAS_LOCAL_URL` in your `.env` before running
 
 ## Current state
 
-This directory is intentionally empty — no entities are defined yet. Running
-`make generate` against an empty schema directory will no-op (or emit a
-benign error) until the first entity is added.
+This directory is intentionally empty — no entities are defined yet, and the
+Ent + Atlas workflow is not yet active at runtime. The service currently
+applies its schema via an idempotent embedded DDL block (`migrateSQL` in
+`internal/store/queries.go`) executed in-process at every boot. Migrating to
+Atlas-managed declarative migrations is planned future work (DEF-014 in the
+umbrella repo).
+
+Running `make generate` against an empty schema directory will no-op (or emit
+a benign warning) until the first entity is added.

@@ -54,7 +54,8 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 //
 // Sizing rationale:
 //   - MaxConns 16 stays under Neon Launch's default ceiling while leaving
-//     headroom for Atlas migrations running alongside the poller.
+//     headroom for future tooling (e.g. Atlas migrations when DEF-014 lands)
+//     running alongside the poller.
 //   - MinConns 2 keeps a warm pool so the first poll after idle-suspend
 //     doesn't pay a cold-connect penalty.
 //   - MaxConnIdleTime 4m is deliberately shorter than Neon's ~5m idle-suspend

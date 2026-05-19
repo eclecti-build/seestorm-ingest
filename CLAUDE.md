@@ -5,7 +5,8 @@ Go service that polls NWS/SPC APIs and archives weather events to PostGIS.
 ## Stack
 - **Language:** Go 1.25 (`go.mod` pins 1.25.5)
 - **Database driver:** `github.com/jackc/pgx/v5`
-- **ORM + migrations:** [Ent](https://entgo.io) with [Atlas](https://atlasgo.io) for declarative migrations
+- **Database driver (active):** `github.com/jackc/pgx/v5` — the service applies its schema via an idempotent embedded DDL block (`migrateSQL` in `internal/store/queries.go`) executed in-process at every boot
+- **ORM + migrations (scaffolded, not yet authoritative):** [Ent](https://entgo.io) with [Atlas](https://atlasgo.io) — entity schemas in `ent/schema/` and Atlas config (`atlas.hcl`) are present but have no effect at runtime; adoption is planned future work (DEF-014)
 - **Database:** Neon Postgres + PostGIS
 - **Snapshot storage:** Cloudflare R2 (`active-events.json`)
 - **Deploy target:** Fly.io, primary region `ord` (Chicago — closest to Wisconsin)
@@ -23,7 +24,7 @@ See `Makefile` for the full target list.
 - `cmd/ingest/` — entry point
 - `internal/nws/` — NWS API client
 - `internal/spc/` — SPC storm reports client
-- `internal/store/` — PostGIS storage layer (pgx/v5 today; Ent-generated client landing alongside)
+- `internal/store/` — PostGIS storage layer; schema owned at runtime by `migrateSQL` in `queries.go` (boot-DDL; Ent-generated client not yet in use)
 - `internal/publisher/` — JSON snapshot publisher (local + R2)
 - `internal/poller/` — polling orchestrator
 - `ent/schema/` — Ent entity schema (empty — add `.go` files as entities are introduced)
@@ -71,17 +72,25 @@ Conventional Commits with these prefixes:
 - Errors are wrapped with context (`fmt.Errorf("...: %w", err)`)
 - No `panic()` in library code (panics only in `main` during init failure)
 
-## Migration workflow
+## Schema management — current state
 
-1. Edit or add an entity schema in `ent/schema/<name>.go` (must implement `ent.Schema`).
-2. `make generate` — runs `go generate ./ent/...`, regenerating the Ent client.
-3. `make migrate-diff` — Atlas diffs the Ent schema against the dev database and writes new SQL under `ent/migrate/migrations/`.
-4. **Review the generated SQL** and commit it alongside the schema change.
-5. `make migrate-apply` — Atlas applies the migration at deploy time (run against `DATABASE_URL` / prod env).
+**How the schema is applied today:** `Store.Migrate` in `internal/store/postgres.go` executes the `migrateSQL` constant (`internal/store/queries.go`) inside an explicit transaction at every boot. All DDL uses `IF NOT EXISTS`, making it idempotent. This is the sole mechanism that creates and owns the schema at runtime.
 
-The legacy `migrations/001_initial.sql` stays as a historical record of the hand-written initial schema. All future changes flow through Ent -> Atlas.
+`migrations/001_initial.sql` is a historical record of the hand-written initial schema — it is not executed at runtime and is kept for reference only.
 
-Required env for Atlas:
+**Ent + Atlas (scaffolded, not yet active):** `ent/schema/` and `atlas.hcl` are present and wired up (see `Makefile` targets `generate`, `migrate-diff`, `migrate-apply`) but no entity schemas are defined yet, and Atlas has not generated any migrations. These artifacts have no effect on a running database. Migrating to Atlas-managed declarative migrations is planned future work (DEF-014).
+
+**To add a schema change today:** edit `migrateSQL` in `internal/store/queries.go`. Use `IF NOT EXISTS` / `IF NOT EXISTS` guards so the change is idempotent on existing databases.
+
+**When Ent + Atlas adoption lands (DEF-014):**
+
+1. Add an entity schema in `ent/schema/<name>.go` (must implement `ent.Schema`).
+2. `make generate` — regenerates the Ent client.
+3. `make migrate-diff` — Atlas diffs the Ent schema and writes SQL under `ent/migrate/migrations/`.
+4. Review the generated SQL and commit it alongside the schema change.
+5. `make migrate-apply` — Atlas applies the migration at deploy time.
+
+Required env for Atlas (future):
 - `ATLAS_LOCAL_URL` — local dev Postgres URL (for `migrate-diff`)
 - `DATABASE_URL` — prod Postgres URL (for `migrate-apply`)
 
