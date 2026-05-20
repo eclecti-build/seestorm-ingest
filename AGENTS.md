@@ -3,7 +3,8 @@
 Agent-facing summary of SeeStorm Ingest conventions. For the full context, read `CLAUDE.md`.
 
 ## Stack (quick)
-- Go 1.25, `jackc/pgx/v5`, Ent + Atlas migrations
+- Go 1.25, `jackc/pgx/v5`
+- Schema applied via idempotent boot-DDL (`migrateSQL` in `internal/store/queries.go`); Ent + Atlas are scaffolded but not yet authoritative at runtime (adoption is planned future work)
 - Neon Postgres + PostGIS, Cloudflare R2 snapshots
 - Fly.io region `ord`
 
@@ -21,8 +22,8 @@ Agent-facing summary of SeeStorm Ingest conventions. For the full context, read 
 - Lint: `make lint` (golangci-lint)
 - Format: `make fmt`
 - Regenerate Ent client: `make generate`
-- New migration: edit schema -> `make generate` -> `make migrate-diff` -> review SQL -> commit
-- Apply migrations: `make migrate-apply`
+- Schema change (today): edit `migrateSQL` in `internal/store/queries.go` with `IF NOT EXISTS` guards
+- Ent/Atlas workflow (planned future work): edit schema -> `make generate` -> `make migrate-diff` -> review SQL -> commit -> `make migrate-apply`
 
 ## Rules
 - No `any` in Go type assertions; wrap errors with `%w`
@@ -35,7 +36,7 @@ Agent-facing summary of SeeStorm Ingest conventions. For the full context, read 
 - Generated code in `ent/` is excluded from lint
 
 ## Auth
-None. Ingest output is public (Cloudflare R2 snapshots). Future auth is scoped to specific opt-in features (spotter reports, admin) — see umbrella `docs/FUTURE.md`.
+None. Ingest output is public (Cloudflare R2 snapshots). Future auth is scoped to specific opt-in features (spotter reports, admin).
 
 ## Deploy
 Fly.io via `make fly-deploy` (wraps `flyctl deploy --remote-only`). CI deploy on push to `main` uses `FLY_API_TOKEN`.
