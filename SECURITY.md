@@ -1,13 +1,14 @@
 # Security Policy
 
-## Supported Versions
+SeeStorm is a non-profit public-safety project. We take security seriously.
 
-Until formal releases exist, only the current `main` branch is supported for security fixes.
+## Reporting a vulnerability
 
-## Reporting a Vulnerability
+Email **security@seestorm.org** with details and reproduction steps. Please do
+not open public issues for security problems. We aim to acknowledge within 72
+hours. We support responsible disclosure and will credit reporters who wish it.
 
-Please report suspected vulnerabilities by email to [sean@eclecti-build.com](mailto:sean@eclecti-build.com).
+## Scope
 
-Do not open a public GitHub issue for a security problem. Include enough detail to reproduce the issue, the affected component, and any relevant logs or request/response samples with secrets removed.
-
-We aim to acknowledge reports within 72 hours, triage severity, and coordinate disclosure timing before public details are shared.
+This repository's source. Operational infrastructure (Cloudflare, Fly.io, Neon)
+is reported to the same address.

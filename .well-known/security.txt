@@ -1,0 +1,4 @@
+Contact: mailto:security@seestorm.org
+Preferred-Languages: en
+Policy: https://github.com/eclecti-build/seestorm-ingest/blob/main/SECURITY.md
+Expires: 2027-05-19T00:00:00.000Z
