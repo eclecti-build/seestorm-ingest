@@ -1,0 +1,14 @@
+app = "seestorm-ingest-gulf"
+primary_region = "mia"  # Miami — Gulf/Atlantic coast
+
+[build]
+
+[env]
+  POLL_INTERVAL = "30s"
+  SNAPSHOT_DIR = "/data/snapshots"
+
+  NWS_AREA = "LA,FL,NC,SC"
+
+[mounts]
+  source = "seestorm_data"
+  destination = "/data"

@@ -1,0 +1,14 @@
+app = "seestorm-ingest-plains"
+primary_region = "dfw"  # Dallas — center of Tornado Alley
+
+[build]
+
+[env]
+  POLL_INTERVAL = "30s"
+  SNAPSHOT_DIR = "/data/snapshots"
+
+  NWS_AREA = "KS,OK,TX,NE,SD"
+
+[mounts]
+  source = "seestorm_data"
+  destination = "/data"

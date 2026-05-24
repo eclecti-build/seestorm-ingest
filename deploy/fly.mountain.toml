@@ -1,0 +1,14 @@
+app = "seestorm-ingest-mountain"
+primary_region = "den"  # Denver — Rockies + high plains
+
+[build]
+
+[env]
+  POLL_INTERVAL = "30s"
+  SNAPSHOT_DIR = "/data/snapshots"
+
+  NWS_AREA = "CO,WY,MT,ND,NM,AZ,UT,NV,ID"
+
+[mounts]
+  source = "seestorm_data"
+  destination = "/data"

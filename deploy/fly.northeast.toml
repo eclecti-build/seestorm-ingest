@@ -1,0 +1,14 @@
+app = "seestorm-ingest-northeast"
+primary_region = "ewr"  # Newark — Northeast corridor
+
+[build]
+
+[env]
+  POLL_INTERVAL = "30s"
+  SNAPSHOT_DIR = "/data/snapshots"
+
+  NWS_AREA = "NY,PA,NJ,CT,MA,ME,NH,VT,RI,DE,MD,DC,VA,WV"
+
+[mounts]
+  source = "seestorm_data"
+  destination = "/data"

@@ -1,0 +1,14 @@
+app = "seestorm-ingest-pacific"
+primary_region = "sjc"  # San Jose — West Coast + islands/territories
+
+[build]
+
+[env]
+  POLL_INTERVAL = "30s"
+  SNAPSHOT_DIR = "/data/snapshots"
+
+  NWS_AREA = "CA,OR,WA,HI,AK,AS,GU,MP,PR,VI"
+
+[mounts]
+  source = "seestorm_data"
+  destination = "/data"

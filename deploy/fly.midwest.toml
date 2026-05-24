@@ -1,0 +1,13 @@
+app = "seestorm-ingest-midwest"
+primary_region = "ord"  # Chicago — Upper Midwest + Ohio Valley
+
+[build]
+
+[env]
+  POLL_INTERVAL = "30s"
+  SNAPSHOT_DIR = "/data/snapshots"
+  NWS_AREA = "WI,MN,IA,IL,IN,MI,OH,MO,KY"
+
+[mounts]
+  source = "seestorm_data"
+  destination = "/data"

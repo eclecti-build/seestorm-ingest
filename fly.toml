@@ -1,11 +1,12 @@
 app = "seestorm-ingest"
-primary_region = "ord"  # Chicago - closest to Wisconsin
+primary_region = "ord"  # Chicago — central US, good latency to NWS API
 
 [build]
 
 [env]
   POLL_INTERVAL = "30s"
   SNAPSHOT_DIR = "/data/snapshots"
+  NWS_AREA = "AL,AK,AZ,AR,CA,CO,CT,DC,DE,FL,GA,HI,ID,IL,IN,IA,KS,KY,LA,ME,MD,MA,MI,MN,MS,MO,MT,NE,NV,NH,NJ,NM,NY,NC,ND,OH,OK,OR,PA,RI,SC,SD,TN,TX,UT,VT,VA,WA,WV,WI,WY,AS,GU,MP,PR,VI"
 
 [mounts]
   source = "seestorm_data"

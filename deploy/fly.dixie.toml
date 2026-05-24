@@ -1,0 +1,14 @@
+app = "seestorm-ingest-dixie"
+primary_region = "atl"  # Atlanta — Dixie Alley
+
+[build]
+
+[env]
+  POLL_INTERVAL = "30s"
+  SNAPSHOT_DIR = "/data/snapshots"
+
+  NWS_AREA = "AL,MS,TN,AR,GA"
+
+[mounts]
+  source = "seestorm_data"
+  destination = "/data"
