@@ -1,5 +1,5 @@
 app = "seestorm-ingest-dixie"
-primary_region = "atl"  # Atlanta — Dixie Alley
+primary_region = "iad"  # Ashburn — closest Fly region to Dixie Alley
 
 [build]
 

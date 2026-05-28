@@ -1,5 +1,5 @@
 app = "seestorm-ingest-gulf"
-primary_region = "mia"  # Miami — Gulf/Atlantic coast
+primary_region = "iad"  # Ashburn — closest Fly region to Gulf/Atlantic coast
 
 [build]
 

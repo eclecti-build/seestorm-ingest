@@ -1,5 +1,5 @@
 app = "seestorm-ingest-mountain"
-primary_region = "den"  # Denver — Rockies + high plains
+primary_region = "dfw"  # Dallas — closest Fly region to Rockies/Mountain West
 
 [build]
 
