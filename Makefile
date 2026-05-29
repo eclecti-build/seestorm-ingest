@@ -1,4 +1,4 @@
-.PHONY: build run test test-cover lint fmt vet tidy generate migrate-diff migrate-apply clean docker-build fly-deploy
+.PHONY: build run test test-cover lint fmt vet tidy generate migrate-diff migrate-apply clean docker-build fly-deploy deploy-fleet deploy-fleet-check
 
 build:
 	go build -o bin/ingest ./cmd/ingest
@@ -43,3 +43,12 @@ docker-build:
 
 fly-deploy:
 	flyctl deploy --remote-only
+
+# Deploy the whole ingest fleet (publisher + all region ingesters) so they stay
+# on the same image. CI only deploys seestorm-ingest; run this after a merge to
+# ship the regionals too. Role/region come from each app's durable Fly secrets.
+deploy-fleet:
+	./scripts/deploy-fleet.sh
+
+deploy-fleet-check:
+	./scripts/deploy-fleet.sh --check

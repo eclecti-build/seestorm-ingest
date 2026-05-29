@@ -39,6 +39,27 @@ The published snapshot carries a `schema_version` field; the client refuses
 to render an unrecognized version. Bump `publisher.SnapshotSchemaVersion`
 when the wire shape changes and coordinate the client PR before deploying.
 
+## Fleet & deployment
+
+Ingest runs as **8 Fly apps** sharing one Neon DB and one R2 bucket
+(`seestorm-data`), all built from THIS repo (there are no per-region repos):
+
+- `seestorm-ingest` — the **publisher** (`MODE=publish`): reads the shared DB and
+  writes the merged + history snapshot to R2 every 30s. Does not poll upstreams.
+- `seestorm-ingest-{dixie,gulf,midwest,mountain,northeast,pacific,plains}` —
+  region **ingesters** (`MODE=ingest`): each polls NWS for its `NWS_AREA` states
+  and upserts the shared DB. They do not publish.
+
+`MODE` (role) and `NWS_AREA` (region) live as **durable Fly secrets** per app —
+never in `fly.toml` — so a deploy can't clobber them. **Exactly one app may have
+`MODE=publish`**; running more than one publisher multiplies R2 history writes
+and collapses the client's history window (the 2026-05 incident).
+
+`.github/workflows/deploy.yml` auto-deploys **only `seestorm-ingest`** on push to
+`main`. Ship the rest with `make deploy-fleet` (pushes the current image to all 8;
+role/region come from each app's secrets). `make deploy-fleet-check` lists the
+roster and each app's current image.
+
 ## Auth
 **None.** The ingest service exposes no authenticated endpoints today — its output (snapshot JSON on Cloudflare R2) is public by design. Public safety data stays frictionless.
 
