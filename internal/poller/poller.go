@@ -24,6 +24,9 @@ type Config struct {
 	// comma-separated list as a single `?area=` query, so multi-state
 	// polling stays one HTTP request regardless of slice length.
 	Areas []string
+	// Mode selects which phases of the cycle this node runs (ingest, publish,
+	// or both). The zero value behaves as ModeBoth. See Mode.
+	Mode Mode
 }
 
 type Poller struct {
@@ -149,6 +152,10 @@ func splitCycleBudget(cycleTimeout time.Duration) (fetchStoreBudget, publishBudg
 //     cycleTimeout - publishBudget.
 //  2. publish phase — publishSnapshot, bounded at publishBudget (fixed 15s).
 //
+// Each phase is gated by the configured Mode: an ingest-only node skips the
+// publish phase, and a publish-only node skips fetch+store entirely (it never
+// touches NWS/SPC and publishes purely from the shared database).
+//
 // The phases share pollCtx as parent, so caller-level cancellation
 // propagates to both. Critically, the publish phase gets its own fresh
 // deadline regardless of how long fetch+store took — a slow upstream fetch
@@ -176,23 +183,33 @@ func (p *Poller) poll(pollCtx context.Context) {
 	cycleTimeout := deriveCycleTimeout(p.cfg.PollInterval)
 	fetchStoreBudget, publishBudget := splitCycleBudget(cycleTimeout)
 
-	// Fetch+store phase: bounded so a slow NWS/SPC can't consume the whole
-	// cycle budget. When this context expires, in-flight fetches/upserts are
-	// cancelled but the publish phase below still gets its own fresh budget.
-	fetchStoreCtx, fetchStoreCancel := context.WithTimeout(pollCtx, fetchStoreBudget)
-	alertCount := p.pollAlerts(fetchStoreCtx)
-	reportCount := p.pollStormReports(fetchStoreCtx)
-	fetchStoreCancel()
+	var alertCount, reportCount int
 
-	// Publish phase: independent deadline derived from pollCtx, not from the
-	// (possibly nearly-exhausted) fetchStoreCtx. This is the fix for Codex
-	// C3 — a cycle where fetch/store consumed ~all its budget previously
-	// left publish with <1s and the R2 snapshot went stale.
-	publishCtx, publishCancel := context.WithTimeout(pollCtx, publishBudget)
-	defer publishCancel()
-	p.publishSnapshot(publishCtx)
+	// Fetch+store phase (ingest + both modes): bounded so a slow NWS/SPC can't
+	// consume the whole cycle budget. When this context expires, in-flight
+	// fetches/upserts are cancelled but the publish phase below still gets its
+	// own fresh budget. Publish-only nodes skip this entirely.
+	if p.cfg.Mode.ShouldIngest() {
+		fetchStoreCtx, fetchStoreCancel := context.WithTimeout(pollCtx, fetchStoreBudget)
+		alertCount = p.pollAlerts(fetchStoreCtx)
+		reportCount = p.pollStormReports(fetchStoreCtx)
+		fetchStoreCancel()
+	}
+
+	// Publish phase (publish + both modes): independent deadline derived from
+	// pollCtx, not from the (possibly nearly-exhausted) fetchStoreCtx. This is
+	// the fix for Codex C3 — a cycle where fetch/store consumed ~all its budget
+	// previously left publish with <1s and the R2 snapshot went stale.
+	// Ingest-only nodes skip this so only the designated publisher writes the
+	// merged + history snapshot.
+	if p.cfg.Mode.ShouldPublish() {
+		publishCtx, publishCancel := context.WithTimeout(pollCtx, publishBudget)
+		p.publishSnapshot(publishCtx)
+		publishCancel()
+	}
 
 	slog.Info("poll cycle complete",
+		"mode", string(p.cfg.Mode),
 		"alerts_processed", alertCount,
 		"reports_processed", reportCount,
 		"duration", time.Since(start),

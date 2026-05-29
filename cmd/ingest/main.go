@@ -66,6 +66,15 @@ func run() error {
 		}
 	}
 
+	// MODE splits the fleet into region-scoped ingesters and a single snapshot
+	// publisher. Unset defaults to "both" (poll + publish), preserving the
+	// historical single-node behavior. An invalid value fails fast rather than
+	// silently falling back to "both" — see poller.ParseMode.
+	mode, err := poller.ParseMode(os.Getenv("MODE"))
+	if err != nil {
+		return err
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -85,7 +94,12 @@ func run() error {
 	// them empty gracefully falls back to file-only.
 	publishers := []publisher.Publisher{publisher.NewFile(snapshotDir)}
 
-	if r2AccountID := os.Getenv("R2_ACCOUNT_ID"); r2AccountID != "" {
+	// Only nodes that actually publish need R2. Gating on the mode means an
+	// ingest-only node never constructs the R2 client — so it can't fail
+	// startup on absent or invalid R2 credentials it would never use.
+	if !mode.ShouldPublish() {
+		slog.Info("r2 publisher skipped (ingest-only mode)")
+	} else if r2AccountID := os.Getenv("R2_ACCOUNT_ID"); r2AccountID != "" {
 		r2Pub, err := publisher.NewR2(ctx, publisher.R2Config{
 			AccountID:       r2AccountID,
 			AccessKeyID:     os.Getenv("R2_ACCESS_KEY_ID"),
@@ -112,9 +126,11 @@ func run() error {
 		Publisher:    pub,
 		PollInterval: pollInterval,
 		Areas:        areas,
+		Mode:         mode,
 	})
 
 	slog.Info("starting seestorm-ingest",
+		"mode", string(mode),
 		"poll_interval", pollInterval,
 		"areas", areas,
 		"user_agent", nwsUserAgent,
