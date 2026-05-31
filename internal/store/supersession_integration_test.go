@@ -358,3 +358,61 @@ func TestSchema_RetiredRowExcludedFromSnapshot(t *testing.T) {
 		}
 	}
 }
+
+// Real prod case (KSGF.SV.W.0235, MO, 2026-05-31): a Severe Thunderstorm Warning
+// issued NEW for 4 counties (AWIPS SVRSGF, WMO WUUS53 KSGF 311712) was continued
+// minutes later by a Severe Weather Statement for Phelps only (AWIPS SVSSGF, WMO
+// WWUS53 KSGF 311757) that `references` the original. Across that supersession
+// BOTH AWIPSidentifier and WMOidentifier change AND the footprint shrinks — so
+// neither identifier can dedupe, and PR1's (eventID, event_type, area_desc) key
+// misses it because area_desc changed. PR2 retires the original via references +
+// matching event_type. This pins that behavior against the real payload shape.
+func TestRetire_RealWorld_SVRtoSVSContinuation(t *testing.T) {
+	s, ctx := newTestStore(t)
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-pr2-svrsvs-%'")
+
+	// Same event_type + same VTEC ETN, but a changed area_desc — the exact shape
+	// that defeats PR1's area_desc-keyed collapse. Parameters carry the P-VTEC so
+	// the snapshot derives the same eventID for both (proving PR1 would keep both).
+	withVTEC := func(id, area, vtec string, refs ...string) nws.Alert {
+		a := alertNoVTEC(id, "Severe Thunderstorm Warning", area, refs...)
+		a.Properties.Parameters = map[string][]string{"VTEC": {vtec}}
+		return a
+	}
+
+	neu := withVTEC("test-pr2-svrsvs-new",
+		"Maries, MO; Miller, MO; Phelps, MO; Pulaski, MO",
+		"/O.NEW.KSGF.SV.W.0235.260531T1712Z-260531T1815Z/")
+	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{neu}); err != nil {
+		t.Fatalf("upsert NEW: %v", err)
+	}
+
+	// Continuation references the NEW message; footprint shrinks to Phelps.
+	con := withVTEC("test-pr2-svrsvs-con", "Phelps, MO",
+		"/O.CON.KSGF.SV.W.0235.000000T0000Z-260531T1815Z/", "test-pr2-svrsvs-new")
+	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{con}); err != nil {
+		t.Fatalf("upsert CON: %v", err)
+	}
+
+	// retired_at proves PR2's write-time retirement fired (PR1 never writes it).
+	if retiredAt(t, s, ctx, "test-pr2-svrsvs-new") == nil {
+		t.Errorf("superseded NEW warning must be retired via references despite area_desc/AWIPS/WMO change")
+	}
+
+	var sawNew, sawCon bool
+	alerts, _ := s.GetActiveAlerts(ctx)
+	for _, a := range alerts {
+		switch a.NWSID {
+		case "test-pr2-svrsvs-new":
+			sawNew = true
+		case "test-pr2-svrsvs-con":
+			sawCon = true
+		}
+	}
+	if sawNew {
+		t.Errorf("superseded 4-county NEW must not appear in the snapshot")
+	}
+	if !sawCon {
+		t.Errorf("the Phelps continuation must remain in the snapshot")
+	}
+}
