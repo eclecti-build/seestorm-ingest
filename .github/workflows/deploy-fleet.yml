@@ -1,0 +1,33 @@
+name: Deploy Fleet (stub)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STUB — fleet deploy is NOT automated yet.
+#
+# The CI auto-deploy (deploy.yml) ships ONLY the publisher (seestorm-ingest).
+# The 7 region ingesters are deployed manually with `make deploy-fleet`.
+#
+# This placeholder is intentionally inert: it is manual-only (workflow_dispatch),
+# never auto-runs, and does NOT deploy anything. It exists so the automation has a
+# home and a paper trail. Before turning it into a real deploy, resolve the two
+# prerequisites in docs/fleet-deploy-automation.md (org-scoped FLY_API_TOKEN +
+# the auth-precheck), then replace the `remind` job with the matrix sketched in
+# that doc.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  remind:
+    name: Fleet deploy is not automated yet
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain (no deploy happens here)
+        run: |
+          echo "::warning title=Fleet deploy not automated::This workflow is a stub and does not deploy."
+          echo "The CI auto-deploy ships ONLY the publisher (seestorm-ingest)."
+          echo "To roll a change to all 8 apps, run locally:  make deploy-fleet"
+          echo "Automation plan + prerequisites: docs/fleet-deploy-automation.md"

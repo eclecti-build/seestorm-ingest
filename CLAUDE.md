@@ -55,10 +55,18 @@ never in `fly.toml` — so a deploy can't clobber them. **Exactly one app may ha
 `MODE=publish`**; running more than one publisher multiplies R2 history writes
 and collapses the client's history window (the 2026-05 incident).
 
-`.github/workflows/deploy.yml` auto-deploys **only `seestorm-ingest`** on push to
-`main`. Ship the rest with `make deploy-fleet` (pushes the current image to all 8;
-role/region come from each app's secrets). `make deploy-fleet-check` lists the
-roster and each app's current image.
+`.github/workflows/deploy.yml` auto-deploys **only `seestorm-ingest`** (the
+publisher) — gated on CI: it runs after the CI workflow succeeds on `main`
+(`workflow_run`). Ship the rest with `make deploy-fleet` (pushes the current image
+to all 8; role/region come from each app's secrets). `make deploy-fleet-check`
+lists the roster and each app's current image.
+
+> ⚠️ **If your change touches the ingesters** — anything under `internal/poller`,
+> `internal/store`, `internal/nws`, or `internal/spc` (polling, upsert,
+> retire/purge, parsing) — the CI auto-deploy ships it to the **publisher only**.
+> It is **NOT live on the 7 region ingesters** until you run `make deploy-fleet`.
+> Skipping this leaves the fleet on mixed image versions. Fleet-deploy automation
+> is stubbed but not yet wired — see `docs/fleet-deploy-automation.md`.
 
 ## Auth
 **None.** The ingest service exposes no authenticated endpoints today — its output (snapshot JSON on Cloudflare R2) is public by design. Public safety data stays frictionless.
