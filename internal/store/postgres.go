@@ -193,6 +193,7 @@ func (s *Store) UpsertAlertsBatch(ctx context.Context, alerts []nws.Alert) (int,
 	)
 
 	count := 0
+	succeeded := make([]nws.Alert, 0, len(alerts))
 	for _, alert := range alerts {
 		if err := s.UpsertAlert(ctx, alert); err != nil {
 			// If the ctx died mid-fallback (cycle deadline fired,
@@ -209,6 +210,20 @@ func (s *Store) UpsertAlertsBatch(ctx context.Context, alerts []nws.Alert) (int,
 			continue
 		}
 		count++
+		succeeded = append(succeeded, alert)
+	}
+
+	// PR2: retire predecessors superseded by the alerts that ACTUALLY landed on
+	// this degraded path (not the whole batch — a referencing alert that failed
+	// its own upsert must not retire its predecessor, or we'd transiently drop a
+	// live warning whose replacement never arrived). Trailing idempotent
+	// statement on the pool; converges next clean cycle. Errors are logged, not
+	// returned: the per-row upserts already succeeded.
+	if _, err := retireReferenced(ctx, s.pool, succeeded); err != nil {
+		slog.WarnContext(ctx, "fallback retire failed (will retry next cycle)",
+			"degraded_path", "fallback_retire",
+			"error", err,
+		)
 	}
 	return count, true, nil
 }
@@ -249,6 +264,13 @@ func (s *Store) upsertAlertsBatchTx(ctx context.Context, alerts []nws.Alert) (in
 	}
 	if batchErr != nil {
 		return 0, fmt.Errorf("batch exec: %w", batchErr)
+	}
+
+	// PR2: retire predecessors this batch supersedes, inside the SAME tx and
+	// AFTER the upserts (Decision 2 ordering) so a predecessor inserted in this
+	// very batch is correctly retired. Idempotent; gated on event_type.
+	if _, err := retireReferenced(ctx, tx, alerts); err != nil {
+		return 0, fmt.Errorf("retire referenced: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -608,6 +630,17 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 	}
 
 	return alerts, nil
+}
+
+// PurgeExpired hard-deletes every row past its expiry (the only place PR2 hard-
+// deletes). Returns the number of rows removed. Safe to run concurrently from
+// multiple ingesters — DELETE of already-dead rows is convergent.
+func (s *Store) PurgeExpired(ctx context.Context) (int64, error) {
+	tag, err := s.pool.Exec(ctx, purgeExpiredSQL)
+	if err != nil {
+		return 0, fmt.Errorf("purging expired rows: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // deriveStates resolves the set of US state abbreviations covered by an

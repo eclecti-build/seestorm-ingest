@@ -193,6 +193,13 @@ func (p *Poller) poll(pollCtx context.Context) {
 		fetchStoreCtx, fetchStoreCancel := context.WithTimeout(pollCtx, fetchStoreBudget)
 		alertCount = p.pollAlerts(fetchStoreCtx)
 		reportCount = p.pollStormReports(fetchStoreCtx)
+		// PR2: drop expired dead rows so the table stops growing unboundedly.
+		// Runs only on ingest-role nodes (writers); idempotent across the fleet.
+		if n, err := p.cfg.Store.PurgeExpired(fetchStoreCtx); err != nil {
+			slog.ErrorContext(fetchStoreCtx, "failed to purge expired rows", "error", err)
+		} else if n > 0 {
+			slog.InfoContext(fetchStoreCtx, "purged expired rows", "deleted", n)
+		}
 		fetchStoreCancel()
 	}
 

@@ -44,6 +44,11 @@ type AlertProperties struct {
 	// the struct, json.Marshal silently drops the upstream geocode and the
 	// SAME-derivation path becomes dead code.
 	Geocode AlertGeocode `json:"geocode"`
+	// References lists the prior CAP message id(s) this message supersedes
+	// (NWS sets it on Update/continuation/correction messages). Drives PR2
+	// write-time retirement. Match on Identifier (the bare urn:oid form that
+	// equals our stored nws_id) — NOT ID, which is the api.weather.gov URL.
+	References []AlertReference `json:"references"`
 }
 
 // AlertGeocode is the subset of `properties.geocode` we use today. SAME
@@ -53,4 +58,13 @@ type AlertProperties struct {
 type AlertGeocode struct {
 	SAME []string `json:"SAME"`
 	UGC  []string `json:"UGC"`
+}
+
+// AlertReference is one entry of `properties.references`: a link to a prior CAP
+// message this one replaces. Identifier matches a stored nws_id; ID is the URL form.
+type AlertReference struct {
+	ID         string `json:"@id"`
+	Identifier string `json:"identifier"`
+	Sender     string `json:"sender"`
+	Sent       string `json:"sent"`
 }
