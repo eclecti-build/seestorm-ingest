@@ -37,6 +37,13 @@ CREATE INDEX IF NOT EXISTS idx_events_type_time ON weather_events(event_type, ef
 CREATE INDEX IF NOT EXISTS idx_events_nws_id ON weather_events(nws_id);
 CREATE INDEX IF NOT EXISTS idx_events_expires ON weather_events(expires_at DESC);
 
+-- PR2: durable supersession. retired_at marks a row superseded by a later
+-- message's references[] (soft-delete; nullable so ADD COLUMN is backward-
+-- compatible and the rolling fleet deploy is order-safe). The partial index
+-- serves the hot snapshot query (expires_at > NOW() AND retired_at IS NULL).
+ALTER TABLE weather_events ADD COLUMN IF NOT EXISTS retired_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_events_active ON weather_events (expires_at DESC) WHERE retired_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS storm_reports (
     id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     report_type   TEXT NOT NULL,
@@ -74,6 +81,10 @@ ON CONFLICT (nws_id) DO UPDATE SET
     properties = EXCLUDED.properties,
     expires_at = EXCLUDED.expires_at,
     updated_at = NOW()
+    -- PR2 Decision 6: retired_at is deliberately NOT refreshed here. A stale
+    -- re-insert of a retired id must keep it retired; adding retired_at to this
+    -- SET list would resurrect superseded rows. Covered by the ON CONFLICT
+    -- invariant test in supersession_integration_test.go.
 `
 
 const upsertStormReportSQL = `
@@ -93,6 +104,6 @@ SELECT
     area_desc, ST_AsGeoJSON(geometry) as geometry,
     effective_at, expires_at, properties
 FROM weather_events
-WHERE expires_at > NOW()
+WHERE expires_at > NOW() AND retired_at IS NULL
 ORDER BY effective_at DESC
 `
