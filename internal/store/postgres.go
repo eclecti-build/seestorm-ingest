@@ -629,6 +629,17 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 	return alerts, nil
 }
 
+// PurgeExpired hard-deletes every row past its expiry (the only place PR2 hard-
+// deletes). Returns the number of rows removed. Safe to run concurrently from
+// multiple ingesters — DELETE of already-dead rows is convergent.
+func (s *Store) PurgeExpired(ctx context.Context) (int64, error) {
+	tag, err := s.pool.Exec(ctx, purgeExpiredSQL)
+	if err != nil {
+		return 0, fmt.Errorf("purging expired rows: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // deriveStates resolves the set of US state abbreviations covered by an
 // alert. Preferred source is the NWS `geocode.SAME` codes (structured,
 // unambiguous — first 2 digits map to the FIPS state). Fallback is naive

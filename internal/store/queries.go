@@ -117,3 +117,9 @@ UPDATE weather_events
 SET retired_at = NOW()
 WHERE nws_id = ANY($1) AND retired_at IS NULL AND event_type = $2
 `
+
+// purgeExpiredSQL hard-deletes every expired row. Any row with expires_at in the
+// past is invisible to the snapshot (WHERE expires_at > NOW()) and read by
+// nothing else — history is built from archived R2 snapshots, not DB rows — so
+// it is dead weight. Deletes naturally-expired AND superseded-then-expired rows.
+const purgeExpiredSQL = `DELETE FROM weather_events WHERE expires_at < NOW()`

@@ -217,6 +217,49 @@ func TestRetire_Idempotent(t *testing.T) {
 	}
 }
 
+// Purge deletes ALL expired rows (superseded AND naturally expired), keeps live
+// and retired-but-unexpired rows (Codex P2 — most dead rows simply expire).
+func TestPurgeExpired(t *testing.T) {
+	s, ctx := newTestStore(t)
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-pr2-purge-%'")
+
+	// live: not expired, not retired -> kept
+	// retiredLive: retired but not expired -> kept (soft-delete recoverable)
+	// expiredNatural: expired, never retired -> deleted
+	for _, a := range []nws.Alert{
+		alertNoVTEC("test-pr2-purge-live", "Flood Warning", "Dane, WI"),
+		alertNoVTEC("test-pr2-purge-retiredlive", "Flood Warning", "Dane, WI"),
+		alertNoVTEC("test-pr2-purge-expired", "Flood Warning", "Dane, WI"),
+	} {
+		_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{a})
+	}
+	// Make retiredlive retired-but-unexpired, and expired naturally expired.
+	_, _ = s.pool.Exec(ctx, "UPDATE weather_events SET retired_at = NOW() WHERE nws_id = 'test-pr2-purge-retiredlive'")
+	_, _ = s.pool.Exec(ctx, "UPDATE weather_events SET expires_at = NOW() - INTERVAL '1 hour' WHERE nws_id = 'test-pr2-purge-expired'")
+
+	n, err := s.PurgeExpired(ctx)
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if n < 1 {
+		t.Errorf("expected at least the naturally-expired row deleted, got %d", n)
+	}
+	exists := func(id string) bool {
+		var c int
+		_ = s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM weather_events WHERE nws_id = $1", id).Scan(&c)
+		return c > 0
+	}
+	if !exists("test-pr2-purge-live") {
+		t.Errorf("live row must be kept")
+	}
+	if !exists("test-pr2-purge-retiredlive") {
+		t.Errorf("retired-but-unexpired row must be kept")
+	}
+	if exists("test-pr2-purge-expired") {
+		t.Errorf("naturally-expired row must be purged")
+	}
+}
+
 // Baseline: the schema has a retired_at column and the snapshot excludes a row
 // once retired_at is set.
 func TestSchema_RetiredRowExcludedFromSnapshot(t *testing.T) {
