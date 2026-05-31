@@ -260,6 +260,40 @@ func TestPurgeExpired(t *testing.T) {
 	}
 }
 
+// Fail-safe: on the fallback path, if the REFERENCING alert is itself the
+// poisoned row (never lands), it must NOT retire its predecessor — otherwise we
+// transiently drop a live warning whose replacement never arrived.
+func TestRetire_FallbackPoisonedReferencerKeepsPredecessor(t *testing.T) {
+	s, ctx := newTestStore(t)
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-pr2-poisonref-%'")
+
+	// Seed predecessor X in a clean batch.
+	x := alertNoVTEC("test-pr2-poisonref-x", "Flood Warning", "Dane, WI")
+	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
+		t.Fatalf("seed x: %v", err)
+	}
+
+	// A separate poisoned non-referencing row forces the batch tx to roll back
+	// (so the fallback path runs). Y references X but is ITSELF poisoned —
+	// malformed geometry — so Y never lands.
+	poison := alertNoVTEC("test-pr2-poisonref-trigger", "Flood Warning", "Dane, WI")
+	poison.Geometry = json.RawMessage(`{"type":"NotAGeometry"}`)
+	y := alertNoVTEC("test-pr2-poisonref-y", "Flood Warning", "Dane, WI", "test-pr2-poisonref-x")
+	y.Geometry = json.RawMessage(`{"type":"NotAGeometry"}`)
+
+	_, degraded, err := s.UpsertAlertsBatch(ctx, []nws.Alert{poison, y})
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if !degraded {
+		t.Fatalf("expected the degraded fallback path to run")
+	}
+	// Y failed to land, so X must remain live (NOT retired).
+	if retiredAt(t, s, ctx, "test-pr2-poisonref-x") != nil {
+		t.Errorf("X must stay live: a referencing alert that never landed must not retire its predecessor")
+	}
+}
+
 // ACCEPTED KNOWN LEAK (spec Decision 5): out-of-order arrival — Y (references X)
 // is ingested BEFORE X, and X has a changed footprint (different area_desc) and
 // no VTEC. Y's retire no-op'd (X absent), then X lands un-retired; PR1 cannot

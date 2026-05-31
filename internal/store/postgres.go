@@ -193,6 +193,7 @@ func (s *Store) UpsertAlertsBatch(ctx context.Context, alerts []nws.Alert) (int,
 	)
 
 	count := 0
+	succeeded := make([]nws.Alert, 0, len(alerts))
 	for _, alert := range alerts {
 		if err := s.UpsertAlert(ctx, alert); err != nil {
 			// If the ctx died mid-fallback (cycle deadline fired,
@@ -209,14 +210,16 @@ func (s *Store) UpsertAlertsBatch(ctx context.Context, alerts []nws.Alert) (int,
 			continue
 		}
 		count++
+		succeeded = append(succeeded, alert)
 	}
 
-	// PR2: the fallback path commits each row on its own, so run retirement as a
-	// trailing idempotent statement on the pool (no surrounding tx here — the
-	// cycle is already degraded; correctness comes from idempotency, and it
-	// converges on the next clean cycle regardless). Without this, a degraded
-	// cycle inserts referencing alerts without retiring their predecessors.
-	if _, err := retireReferenced(ctx, s.pool, alerts); err != nil {
+	// PR2: retire predecessors superseded by the alerts that ACTUALLY landed on
+	// this degraded path (not the whole batch — a referencing alert that failed
+	// its own upsert must not retire its predecessor, or we'd transiently drop a
+	// live warning whose replacement never arrived). Trailing idempotent
+	// statement on the pool; converges next clean cycle. Errors are logged, not
+	// returned: the per-row upserts already succeeded.
+	if _, err := retireReferenced(ctx, s.pool, succeeded); err != nil {
 		slog.WarnContext(ctx, "fallback retire failed (will retry next cycle)",
 			"degraded_path", "fallback_retire",
 			"error", err,
