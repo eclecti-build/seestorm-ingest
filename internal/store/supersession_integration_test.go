@@ -140,6 +140,36 @@ func TestRetire_SameBatchOrdering(t *testing.T) {
 	}
 }
 
+// On the degraded fallback path (a poisoned row aborts the batch tx), a good
+// referencing alert must still retire its predecessor.
+func TestRetire_FallbackPathRetires(t *testing.T) {
+	s, ctx := newTestStore(t)
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-pr2-fallback-%'")
+
+	// Seed the predecessor in its own clean batch.
+	x := alertNoVTEC("test-pr2-fallback-x", "Flood Warning", "Dane, WI")
+	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
+		t.Fatalf("seed x: %v", err)
+	}
+
+	// poisoned has malformed geometry that fails ST_GeomFromGeoJSON, forcing the
+	// whole batch tx to roll back and the per-alert fallback to run.
+	poisoned := alertNoVTEC("test-pr2-fallback-bad", "Flood Warning", "Dane, WI")
+	poisoned.Geometry = json.RawMessage(`{"type":"NotAGeometry"}`)
+	good := alertNoVTEC("test-pr2-fallback-y", "Flood Warning", "Dane, WI", "test-pr2-fallback-x")
+
+	_, degraded, err := s.UpsertAlertsBatch(ctx, []nws.Alert{poisoned, good})
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if !degraded {
+		t.Fatalf("expected the degraded fallback path to run")
+	}
+	if retiredAt(t, s, ctx, "test-pr2-fallback-x") == nil {
+		t.Errorf("predecessor must be retired even on the fallback path")
+	}
+}
+
 // Baseline: the schema has a retired_at column and the snapshot excludes a row
 // once retired_at is set.
 func TestSchema_RetiredRowExcludedFromSnapshot(t *testing.T) {

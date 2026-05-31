@@ -210,6 +210,18 @@ func (s *Store) UpsertAlertsBatch(ctx context.Context, alerts []nws.Alert) (int,
 		}
 		count++
 	}
+
+	// PR2: the fallback path commits each row on its own, so run retirement as a
+	// trailing idempotent statement on the pool (no surrounding tx here — the
+	// cycle is already degraded; correctness comes from idempotency, and it
+	// converges on the next clean cycle regardless). Without this, a degraded
+	// cycle inserts referencing alerts without retiring their predecessors.
+	if _, err := retireReferenced(ctx, s.pool, alerts); err != nil {
+		slog.WarnContext(ctx, "fallback retire failed (will retry next cycle)",
+			"degraded_path", "fallback_retire",
+			"error", err,
+		)
+	}
 	return count, true, nil
 }
 
