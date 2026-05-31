@@ -54,7 +54,7 @@ func alertNoVTEC(id, event, areaDesc string, refs ...string) nws.Alert {
 	}
 }
 
-func retiredAt(t *testing.T, s *Store, ctx context.Context, nwsID string) *time.Time {
+func retiredAt(ctx context.Context, t *testing.T, s *Store, nwsID string) *time.Time {
 	t.Helper()
 	var ts *time.Time
 	err := s.pool.QueryRow(ctx,
@@ -80,10 +80,10 @@ func TestRetire_SupersededPredecessorRetired(t *testing.T) {
 		t.Fatalf("upsert y: %v", err)
 	}
 
-	if retiredAt(t, s, ctx, "test-pr2-retire-x") == nil {
+	if retiredAt(ctx, t, s, "test-pr2-retire-x") == nil {
 		t.Errorf("x should be retired")
 	}
-	if retiredAt(t, s, ctx, "test-pr2-retire-y") != nil {
+	if retiredAt(ctx, t, s, "test-pr2-retire-y") != nil {
 		t.Errorf("y should not be retired")
 	}
 	alerts, _ := s.GetActiveAlerts(ctx)
@@ -105,7 +105,7 @@ func TestRetire_EventTypeMismatchKeepsRow(t *testing.T) {
 	y := alertNoVTEC("test-pr2-mismatch-y", "Special Weather Statement", "Dane, WI", "test-pr2-mismatch-x")
 	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{y})
 
-	if retiredAt(t, s, ctx, "test-pr2-mismatch-x") != nil {
+	if retiredAt(ctx, t, s, "test-pr2-mismatch-x") != nil {
 		t.Errorf("x must NOT be retired across a different event_type (fail-safe)")
 	}
 }
@@ -119,7 +119,7 @@ func TestRetire_MissingReferenceIsNoOp(t *testing.T) {
 	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{y}); err != nil {
 		t.Fatalf("upsert y referencing a never-ingested id should not error: %v", err)
 	}
-	if retiredAt(t, s, ctx, "test-pr2-missing-y") != nil {
+	if retiredAt(ctx, t, s, "test-pr2-missing-y") != nil {
 		t.Errorf("y should not be retired")
 	}
 }
@@ -135,7 +135,7 @@ func TestRetire_SameBatchOrdering(t *testing.T) {
 	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x, y}); err != nil {
 		t.Fatalf("upsert batch: %v", err)
 	}
-	if retiredAt(t, s, ctx, "test-pr2-order-x") == nil {
+	if retiredAt(ctx, t, s, "test-pr2-order-x") == nil {
 		t.Errorf("x should be retired even when inserted in the same batch as y")
 	}
 }
@@ -165,7 +165,7 @@ func TestRetire_FallbackPathRetires(t *testing.T) {
 	if !degraded {
 		t.Fatalf("expected the degraded fallback path to run")
 	}
-	if retiredAt(t, s, ctx, "test-pr2-fallback-x") == nil {
+	if retiredAt(ctx, t, s, "test-pr2-fallback-x") == nil {
 		t.Errorf("predecessor must be retired even on the fallback path")
 	}
 }
@@ -180,7 +180,7 @@ func TestRetire_ReinsertKeepsRetired(t *testing.T) {
 	y := alertNoVTEC("test-pr2-reinsert-y", "Flood Warning", "Dane, WI", "test-pr2-reinsert-x")
 	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{x})
 	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{y})
-	if retiredAt(t, s, ctx, "test-pr2-reinsert-x") == nil {
+	if retiredAt(ctx, t, s, "test-pr2-reinsert-x") == nil {
 		t.Fatalf("precondition: x should be retired")
 	}
 
@@ -188,7 +188,7 @@ func TestRetire_ReinsertKeepsRetired(t *testing.T) {
 	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
 		t.Fatalf("re-upsert x: %v", err)
 	}
-	if retiredAt(t, s, ctx, "test-pr2-reinsert-x") == nil {
+	if retiredAt(ctx, t, s, "test-pr2-reinsert-x") == nil {
 		t.Errorf("re-inserting a retired id must NOT clear retired_at")
 	}
 }
@@ -202,7 +202,7 @@ func TestRetire_Idempotent(t *testing.T) {
 	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{x})
 	y := alertNoVTEC("test-pr2-idem-y", "Flood Warning", "Dane, WI", "test-pr2-idem-x")
 	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{y})
-	first := retiredAt(t, s, ctx, "test-pr2-idem-x")
+	first := retiredAt(ctx, t, s, "test-pr2-idem-x")
 
 	// Apply the same retirement again directly; row count affected should be 0.
 	n, err := retireReferenced(ctx, s.pool, []nws.Alert{y})
@@ -212,7 +212,7 @@ func TestRetire_Idempotent(t *testing.T) {
 	if n != 0 {
 		t.Errorf("second retire affected %d rows, want 0 (idempotent)", n)
 	}
-	if second := retiredAt(t, s, ctx, "test-pr2-idem-x"); second == nil || !second.Equal(*first) {
+	if second := retiredAt(ctx, t, s, "test-pr2-idem-x"); second == nil || !second.Equal(*first) {
 		t.Errorf("retired_at changed on second apply: %v -> %v", first, second)
 	}
 }
@@ -289,7 +289,7 @@ func TestRetire_FallbackPoisonedReferencerKeepsPredecessor(t *testing.T) {
 		t.Fatalf("expected the degraded fallback path to run")
 	}
 	// Y failed to land, so X must remain live (NOT retired).
-	if retiredAt(t, s, ctx, "test-pr2-poisonref-x") != nil {
+	if retiredAt(ctx, t, s, "test-pr2-poisonref-x") != nil {
 		t.Errorf("X must stay live: a referencing alert that never landed must not retire its predecessor")
 	}
 }
@@ -315,7 +315,7 @@ func TestRetire_OutOfOrderArrival_AcceptedLeak(t *testing.T) {
 		t.Fatalf("upsert x: %v", err)
 	}
 
-	if retiredAt(t, s, ctx, "test-pr2-ooo-x") != nil {
+	if retiredAt(ctx, t, s, "test-pr2-ooo-x") != nil {
 		t.Errorf("documented behavior: late X is NOT retired (no signal retires it)")
 	}
 	var inSnapshot bool
@@ -395,7 +395,7 @@ func TestRetire_RealWorld_SVRtoSVSContinuation(t *testing.T) {
 	}
 
 	// retired_at proves PR2's write-time retirement fired (PR1 never writes it).
-	if retiredAt(t, s, ctx, "test-pr2-svrsvs-new") == nil {
+	if retiredAt(ctx, t, s, "test-pr2-svrsvs-new") == nil {
 		t.Errorf("superseded NEW warning must be retired via references despite area_desc/AWIPS/WMO change")
 	}
 
