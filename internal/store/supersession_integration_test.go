@@ -260,6 +260,42 @@ func TestPurgeExpired(t *testing.T) {
 	}
 }
 
+// ACCEPTED KNOWN LEAK (spec Decision 5): out-of-order arrival — Y (references X)
+// is ingested BEFORE X, and X has a changed footprint (different area_desc) and
+// no VTEC. Y's retire no-op'd (X absent), then X lands un-retired; PR1 cannot
+// collapse it (no shared VTEC eventID), so X stays in the snapshot until expiry.
+// This test pins the leak as intentional and bounded; if a future change retires
+// X here, that is a behavior change to review, not an automatic win.
+func TestRetire_OutOfOrderArrival_AcceptedLeak(t *testing.T) {
+	s, ctx := newTestStore(t)
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-pr2-ooo-%'")
+
+	// Y arrives first, referencing an X that is not in the DB yet.
+	y := alertNoVTEC("test-pr2-ooo-y", "Flood Warning", "Dane, WI", "test-pr2-ooo-x")
+	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{y}); err != nil {
+		t.Fatalf("upsert y: %v", err)
+	}
+	// X arrives late with a different footprint and no VTEC.
+	x := alertNoVTEC("test-pr2-ooo-x", "Flood Warning", "Sauk, WI")
+	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
+		t.Fatalf("upsert x: %v", err)
+	}
+
+	if retiredAt(t, s, ctx, "test-pr2-ooo-x") != nil {
+		t.Errorf("documented behavior: late X is NOT retired (no signal retires it)")
+	}
+	var inSnapshot bool
+	alerts, _ := s.GetActiveAlerts(ctx)
+	for _, a := range alerts {
+		if a.NWSID == "test-pr2-ooo-x" {
+			inSnapshot = true
+		}
+	}
+	if !inSnapshot {
+		t.Errorf("documented leak: late X stays in the snapshot until expiry")
+	}
+}
+
 // Baseline: the schema has a retired_at column and the snapshot excludes a row
 // once retired_at is set.
 func TestSchema_RetiredRowExcludedFromSnapshot(t *testing.T) {
