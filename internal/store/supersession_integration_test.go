@@ -65,6 +65,81 @@ func retiredAt(t *testing.T, s *Store, ctx context.Context, nwsID string) *time.
 	return ts
 }
 
+// Happy path: Y references X with matching event_type → X retired, gone from
+// the snapshot, Y present.
+func TestRetire_SupersededPredecessorRetired(t *testing.T) {
+	s, ctx := newTestStore(t)
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-pr2-retire-%'")
+
+	x := alertNoVTEC("test-pr2-retire-x", "Flood Warning", "Dane, WI")
+	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
+		t.Fatalf("upsert x: %v", err)
+	}
+	y := alertNoVTEC("test-pr2-retire-y", "Flood Warning", "Dane, WI", "test-pr2-retire-x")
+	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{y}); err != nil {
+		t.Fatalf("upsert y: %v", err)
+	}
+
+	if retiredAt(t, s, ctx, "test-pr2-retire-x") == nil {
+		t.Errorf("x should be retired")
+	}
+	if retiredAt(t, s, ctx, "test-pr2-retire-y") != nil {
+		t.Errorf("y should not be retired")
+	}
+	alerts, _ := s.GetActiveAlerts(ctx)
+	for _, a := range alerts {
+		if a.NWSID == "test-pr2-retire-x" {
+			t.Fatalf("retired x leaked into snapshot")
+		}
+	}
+}
+
+// Fail-safe: event_type mismatch → predecessor NOT retired.
+func TestRetire_EventTypeMismatchKeepsRow(t *testing.T) {
+	s, ctx := newTestStore(t)
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-pr2-mismatch-%'")
+
+	x := alertNoVTEC("test-pr2-mismatch-x", "Tornado Warning", "Dane, WI")
+	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{x})
+	// Y is a different product that merely references X.
+	y := alertNoVTEC("test-pr2-mismatch-y", "Special Weather Statement", "Dane, WI", "test-pr2-mismatch-x")
+	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{y})
+
+	if retiredAt(t, s, ctx, "test-pr2-mismatch-x") != nil {
+		t.Errorf("x must NOT be retired across a different event_type (fail-safe)")
+	}
+}
+
+// Missing reference → clean no-op, no error.
+func TestRetire_MissingReferenceIsNoOp(t *testing.T) {
+	s, ctx := newTestStore(t)
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-pr2-missing-%'")
+
+	y := alertNoVTEC("test-pr2-missing-y", "Flood Warning", "Dane, WI", "test-pr2-missing-ghost")
+	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{y}); err != nil {
+		t.Fatalf("upsert y referencing a never-ingested id should not error: %v", err)
+	}
+	if retiredAt(t, s, ctx, "test-pr2-missing-y") != nil {
+		t.Errorf("y should not be retired")
+	}
+}
+
+// Same batch contains both X and a Y that references it → X retired (ordering:
+// upsert before retire).
+func TestRetire_SameBatchOrdering(t *testing.T) {
+	s, ctx := newTestStore(t)
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-pr2-order-%'")
+
+	x := alertNoVTEC("test-pr2-order-x", "Flood Warning", "Dane, WI")
+	y := alertNoVTEC("test-pr2-order-y", "Flood Warning", "Dane, WI", "test-pr2-order-x")
+	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x, y}); err != nil {
+		t.Fatalf("upsert batch: %v", err)
+	}
+	if retiredAt(t, s, ctx, "test-pr2-order-x") == nil {
+		t.Errorf("x should be retired even when inserted in the same batch as y")
+	}
+}
+
 // Baseline: the schema has a retired_at column and the snapshot excludes a row
 // once retired_at is set.
 func TestSchema_RetiredRowExcludedFromSnapshot(t *testing.T) {

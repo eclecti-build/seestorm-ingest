@@ -251,6 +251,13 @@ func (s *Store) upsertAlertsBatchTx(ctx context.Context, alerts []nws.Alert) (in
 		return 0, fmt.Errorf("batch exec: %w", batchErr)
 	}
 
+	// PR2: retire predecessors this batch supersedes, inside the SAME tx and
+	// AFTER the upserts (Decision 2 ordering) so a predecessor inserted in this
+	// very batch is correctly retired. Idempotent; gated on event_type.
+	if _, err := retireReferenced(ctx, tx, alerts); err != nil {
+		return 0, fmt.Errorf("retire referenced: %w", err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit tx: %w", err)
 	}
