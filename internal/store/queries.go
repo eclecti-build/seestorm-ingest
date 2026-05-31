@@ -107,3 +107,13 @@ FROM weather_events
 WHERE expires_at > NOW() AND retired_at IS NULL
 ORDER BY effective_at DESC
 `
+
+// retireByReferenceSQL marks superseded rows retired. $1 is the array of
+// referenced prior nws_ids; $2 is the superseding message's event_type (PR2
+// Decision 3 gate). Idempotent: WHERE retired_at IS NULL means a re-run is a
+// no-op, and an absent referenced id simply matches zero rows.
+const retireByReferenceSQL = `
+UPDATE weather_events
+SET retired_at = NOW()
+WHERE nws_id = ANY($1) AND retired_at IS NULL AND event_type = $2
+`
