@@ -416,6 +416,16 @@ type ActiveAlertGeoJSON struct {
 	// ignores unknown fields). See docs/TORNADO_DETECTION_CONTRACT.md for
 	// the cross-cutting contract.
 	Tornado *nws.TornadoDetection `json:"tornado,omitempty"`
+
+	// eventID is the VTEC logical-warning identity
+	// (office.phenomenon.significance.ETN, e.g. "KIND.FL.W.0102") derived at
+	// read time. Unexported on purpose: it is an internal key used by
+	// collapseByEvent to drop superseded re-issuances of the same warning and
+	// is NEVER serialized into the snapshot. Empty when the alert carries no
+	// parseable VTEC (watches, statements, etc.), in which case the row is
+	// never collapsed. See collapse.go and
+	// docs/superpowers/specs/2026-05-31-alert-duplicate-supersession-design.md.
+	eventID string
 }
 
 // alertPropsParams is the minimal shape we unmarshal out of the JSONB
@@ -540,6 +550,22 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 		}
 		a.Tornado = detection
 
+		// Derive the VTEC event identity used to collapse superseded
+		// re-issuances of the same warning (see collapseByEvent below).
+		// Optional like motion/tornado: (nil,nil) for non-VTEC products
+		// leaves eventID empty (never collapsed); (nil,err) on format drift
+		// logs and still ships the row uncollapsed.
+		vtec, err := nws.ParseVTEC(props.Parameters)
+		switch {
+		case err != nil:
+			slog.WarnContext(ctx, "vtec parse failed",
+				"nws_id", a.NWSID,
+				"error", err,
+			)
+		case vtec != nil:
+			a.eventID = vtec.EventID()
+		}
+
 		alerts = append(alerts, a)
 	}
 	// pgx's rows.Next() returns false on both clean iteration end AND a
@@ -567,6 +593,19 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 		"observed", detObserved,
 		"failed", detFailed,
 	)
+
+	// Collapse superseded duplicates (the same VTEC event re-issued under a
+	// fresh nws_id) down to the latest message before publishing, so the
+	// client renders one card/polygon/arrow per warning instead of one per
+	// stale message. Non-VTEC products pass through untouched.
+	before := len(alerts)
+	alerts = collapseByEvent(alerts)
+	if dropped := before - len(alerts); dropped > 0 {
+		slog.InfoContext(ctx, "snapshot superseded-duplicate collapse",
+			"dropped", dropped,
+			"kept", len(alerts),
+		)
+	}
 
 	return alerts, nil
 }
