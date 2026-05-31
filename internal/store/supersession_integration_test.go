@@ -170,6 +170,53 @@ func TestRetire_FallbackPathRetires(t *testing.T) {
 	}
 }
 
+// A stale re-insert of a retired id must NOT un-retire it (ON CONFLICT must not
+// refresh retired_at — PR2 Decision 6).
+func TestRetire_ReinsertKeepsRetired(t *testing.T) {
+	s, ctx := newTestStore(t)
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-pr2-reinsert-%'")
+
+	x := alertNoVTEC("test-pr2-reinsert-x", "Flood Warning", "Dane, WI")
+	y := alertNoVTEC("test-pr2-reinsert-y", "Flood Warning", "Dane, WI", "test-pr2-reinsert-x")
+	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{x})
+	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{y})
+	if retiredAt(t, s, ctx, "test-pr2-reinsert-x") == nil {
+		t.Fatalf("precondition: x should be retired")
+	}
+
+	// Stale re-upsert of x (same id) — must keep retired_at set.
+	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
+		t.Fatalf("re-upsert x: %v", err)
+	}
+	if retiredAt(t, s, ctx, "test-pr2-reinsert-x") == nil {
+		t.Errorf("re-inserting a retired id must NOT clear retired_at")
+	}
+}
+
+// Retiring twice changes nothing the second time (idempotent).
+func TestRetire_Idempotent(t *testing.T) {
+	s, ctx := newTestStore(t)
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-pr2-idem-%'")
+
+	x := alertNoVTEC("test-pr2-idem-x", "Flood Warning", "Dane, WI")
+	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{x})
+	y := alertNoVTEC("test-pr2-idem-y", "Flood Warning", "Dane, WI", "test-pr2-idem-x")
+	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{y})
+	first := retiredAt(t, s, ctx, "test-pr2-idem-x")
+
+	// Apply the same retirement again directly; row count affected should be 0.
+	n, err := retireReferenced(ctx, s.pool, []nws.Alert{y})
+	if err != nil {
+		t.Fatalf("second retire: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("second retire affected %d rows, want 0 (idempotent)", n)
+	}
+	if second := retiredAt(t, s, ctx, "test-pr2-idem-x"); second == nil || !second.Equal(*first) {
+		t.Errorf("retired_at changed on second apply: %v -> %v", first, second)
+	}
+}
+
 // Baseline: the schema has a retired_at column and the snapshot excludes a row
 // once retired_at is set.
 func TestSchema_RetiredRowExcludedFromSnapshot(t *testing.T) {
