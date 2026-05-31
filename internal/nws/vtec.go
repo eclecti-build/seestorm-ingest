@@ -49,6 +49,20 @@ type VTEC struct {
 // EventID returns the stable logical-warning identity
 // office.phenomenon.significance.ETN (e.g. "KIND.FL.W.0102"). Two CAP messages
 // that share an EventID are the same warning re-issued.
+//
+// Known limitation (P-VTEC year aliasing): ETNs are unique only within a
+// calendar year per office, so a warning continuously active across a New Year
+// boundary could in principle share an EventID with a distinct new event that
+// reuses the same ETN. We deliberately do NOT fold a year into the identity:
+// the onset year is the only correct discriminator, and NWS zeroes the begin
+// time on continuation messages (`.000000T0000Z-…`, verified in production), so
+// it isn't recoverable from a continuation's P-VTEC — adding it would split a
+// live event's own NEW/CON messages and defeat the collapse. The robust fix is
+// references-based supersession (PR2), which keys on explicit message links and
+// is immune to ETN recycling. The residual collision is narrow (same
+// office+phenomenon+significance+ETN+event_type+area_desc, one event active a
+// full year) and the collapse key also includes event_type + area_desc, which
+// shrinks it further. See the design doc's PR2 section.
 func (v *VTEC) EventID() string {
 	return v.Office + "." + v.Phenomenon + "." + v.Significance + "." + v.ETN
 }
