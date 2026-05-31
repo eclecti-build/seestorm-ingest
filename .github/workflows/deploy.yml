@@ -1,7 +1,14 @@
 name: Deploy
 
+# Gated on CI: this runs ONLY after the CI workflow completes successfully on
+# main, so a red build (lint/test/build failure) can never ship — including a
+# direct push to main that bypasses the required-status-check enforced on PRs.
+# (Previously this triggered on every push to main independent of CI, which let
+# the #42 lint failure deploy.)
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches: [main]
 
 permissions:
@@ -10,13 +17,22 @@ permissions:
 jobs:
   deploy:
     name: Fly.io deploy
+    # workflow_run fires for every CI completion (success AND failure), so this
+    # guard is mandatory: only deploy when CI concluded successfully on main.
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.head_branch == 'main' }}
     runs-on: ubuntu-latest
     concurrency:
-      group: fly-deploy-${{ github.ref }}
+      group: fly-deploy-main
       cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          # Deploy the exact commit CI validated, not whatever main HEAD is now
+          # (workflow_run can lag behind a fast follow-up push).
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Set up flyctl
         # Pinned to an immutable commit SHA (supply-chain hardening — no
