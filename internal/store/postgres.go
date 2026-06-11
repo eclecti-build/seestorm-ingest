@@ -439,13 +439,26 @@ type ActiveAlertGeoJSON struct {
 	// the cross-cutting contract.
 	Tornado *nws.TornadoDetection `json:"tornado,omitempty"`
 
+	// VTECEventID serializes the VTEC logical-warning identity
+	// (office.phenomenon.significance.ETN, e.g. "KIND.FL.W.0102") so snapshot
+	// consumers can correlate update messages of the same warning across
+	// nws_id changes (escalation tracking, notification threading —
+	// eclecti-mail is the first consumer). VTECAction is the message's action
+	// code (NEW, CON, CAN, …) so consumers can distinguish issuance from
+	// continuation/cancellation. Additive optional fields like Tornado; carry
+	// NO snapshot schema bump. Empty for non-VTEC products (watches,
+	// statements). Same identity tuple as the internal eventID collapse key —
+	// see that field's doc for the ETN year-aliasing caveat.
+	VTECEventID string `json:"vtec_event_id,omitempty"`
+	VTECAction  string `json:"vtec_action,omitempty"`
+
 	// eventID is the VTEC logical-warning identity
 	// (office.phenomenon.significance.ETN, e.g. "KIND.FL.W.0102") derived at
 	// read time. Unexported on purpose: it is an internal key used by
-	// collapseByEvent to drop superseded re-issuances of the same warning and
-	// is NEVER serialized into the snapshot. Empty when the alert carries no
-	// parseable VTEC (watches, statements, etc.), in which case the row is
-	// never collapsed. See collapse.go and
+	// collapseByEvent to drop superseded re-issuances of the same warning.
+	// VTECEventID above is its serialized counterpart for snapshot consumers.
+	// Empty when the alert carries no parseable VTEC (watches, statements,
+	// etc.), in which case the row is never collapsed. See collapse.go and
 	// docs/superpowers/specs/2026-05-31-alert-duplicate-supersession-design.md.
 	eventID string
 }
@@ -586,6 +599,8 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]ActiveAlertGeoJSON, erro
 			)
 		case vtec != nil:
 			a.eventID = vtec.EventID()
+			a.VTECEventID = a.eventID
+			a.VTECAction = vtec.Action
 		}
 
 		alerts = append(alerts, a)
