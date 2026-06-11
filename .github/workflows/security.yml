@@ -16,8 +16,14 @@ jobs:
           sudo mv gitleaks /usr/local/bin/gitleaks
       - name: gitleaks (blocking)
         run: gitleaks detect --source=. --redact
+      # go-version-file (not a floating '1.25' spec): setup-go exports
+      # GOTOOLCHAIN=local, so go won't self-download the toolchain go.mod
+      # requires — the installed version must satisfy it exactly. A floating
+      # spec resolves to whatever 1.25.x sits in the runner toolcache, which
+      # broke govulncheck when go.mod moved to 1.25.11 ahead of the cache.
+      # ci.yml already reads go.mod; this keeps both on one source of truth.
       - uses: actions/setup-go@v6
-        with: { go-version: '1.25' }
+        with: { go-version-file: go.mod }
       - name: govulncheck (blocking)
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
