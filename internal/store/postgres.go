@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/eclecti-build/seestorm-ingest/internal/nws"
@@ -94,6 +95,61 @@ func (s *Store) Close() {
 	s.pool.Close()
 }
 
+// migrateAdvisoryLockKey is a well-known, arbitrary 64-bit key used to
+// serialize concurrent Store.Migrate calls via pg_advisory_xact_lock. All
+// 8 fleet apps run Migrate at boot against the SAME Neon database (see
+// cmd/ingest/main.go) with no other coordination — a cold fleet-wide
+// redeploy can start all 8 processes within the same second. Concurrent
+// DDL against the same objects (CREATE TABLE/INDEX IF NOT EXISTS, ALTER
+// TABLE ADD COLUMN IF NOT EXISTS) is not safely concurrent in Postgres:
+// two sessions can both pass the IF NOT EXISTS existence check before
+// either commits, then race on the catalog insert — one loses with a
+// duplicate-key or deadlock error, aborting that node's boot.
+//
+// xact-level (not session-level) — see this task's design-decision note
+// in the Tier 2 resilience plan for why: Migrate already runs inside one
+// transaction, and pg_advisory_xact_lock auto-releases on COMMIT/ROLLBACK,
+// matching that lifecycle with no extra bookkeeping. Session-level
+// pg_advisory_lock would require pinning one physical connection across
+// the lock/unlock pair, which pgxpool.Pool.Exec does not guarantee.
+//
+// The numeric value is arbitrary; it only needs to be stable across the
+// fleet and not collide with any other advisory lock key this codebase
+// uses (none, as of this writing — give any future one its own constant).
+const migrateAdvisoryLockKey int64 = 774300010001
+
+// migrateLockTimeout bounds how long Migrate will wait to ACQUIRE
+// migrateAdvisoryLockKey (via Postgres's transaction-scoped lock_timeout
+// parameter, set immediately before the pg_advisory_xact_lock call)
+// before giving up. Because SET LOCAL is transaction-scoped, the same
+// bound also applies to subsequent lock acquisitions inside migrateSQL:
+// previously-unbounded DDL lock waits, such as ALTER TABLE weather_events
+// ADD COLUMN IF NOT EXISTS taking AccessExclusiveLock even as a no-op
+// while conflicting with a long-running concurrent reader, now fail after
+// 15s too. Those DDL timeouts surface through the "running migrations:
+// %w" error path, not the advisory-lock timed-out message whose 55P03
+// check is scoped to the advisory-lock Exec only, and still become a
+// single retryable node boot failure.
+//
+// Deliberately separate from the "SET LOCAL statement_timeout = 0" set
+// earlier in Migrate: that disables the timeout for the DDL statement
+// itself so a slow CREATE INDEX/CREATE EXTENSION isn't killed, but
+// Postgres tracks lock-WAIT time under the separate lock_timeout
+// parameter — disabling statement_timeout does not also disable it.
+//
+// Without this bound, Migrate is invoked from cmd/ingest/main.go under a
+// context with NO deadline at boot. If another node's Migrate is wedged
+// (hung mid-transaction on a connection that's still open — a genuinely
+// CRASHED connection releases the xact lock automatically, so that's not
+// the risk here) holding migrateAdvisoryLockKey, every other one of the
+// 8 fleet apps — which can all start booting within the same second on a
+// fleet-wide `make deploy-fleet` — would block forever: one bad node
+// turns into a fleet-wide deploy outage with no visible error anywhere.
+// 15s is generous versus the sub-second common case (no contention) while
+// bounding the worst case to one retryable boot failure (process exits
+// non-zero, Fly restarts it) instead of an indefinite hang.
+const migrateLockTimeout = 15 * time.Second
+
 // Migrate runs schema DDL inside an explicit transaction and disables
 // statement_timeout for that transaction only. The shared pool bakes in
 // statement_timeout=15000 (see buildPoolConfig) to bound hot-path queries,
@@ -112,6 +168,32 @@ func (s *Store) Migrate(ctx context.Context) error {
 
 	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = 0"); err != nil {
 		return fmt.Errorf("disabling statement_timeout for migrate: %w", err)
+	}
+
+	// Bound the advisory-lock ACQUISITION wait (separate parameter from
+	// statement_timeout above — see migrateLockTimeout's doc comment).
+	// SET LOCAL lock_timeout is transaction-scoped, so this also bounds
+	// previously-unbounded DDL lock waits inside migrateSQL (reported via
+	// "running migrations: %w", not the advisory-lock timeout message).
+	// Must be set before the pg_advisory_xact_lock call below to apply to
+	// it.
+	lockTimeoutSQL := fmt.Sprintf("SET LOCAL lock_timeout = '%ds'", int(migrateLockTimeout.Seconds()))
+	if _, err := tx.Exec(ctx, lockTimeoutSQL); err != nil {
+		return fmt.Errorf("setting migrate lock_timeout: %w", err)
+	}
+
+	// Serialize concurrent fleet boots against the same DDL. Blocks until
+	// any other session's Migrate tx commits or rolls back, OR until
+	// migrateLockTimeout elapses — see migrateAdvisoryLockKey's and
+	// migrateLockTimeout's doc comments. A timeout here surfaces as a
+	// clear, actionable boot failure (below) rather than an indefinite
+	// hang, so the process exits and Fly restarts it.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", migrateAdvisoryLockKey); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "55P03" { // lock_not_available
+			return fmt.Errorf("migrate: timed out waiting for fleet migration lock after %s — another node may be wedged holding it; retry the deploy: %w", migrateLockTimeout, err)
+		}
+		return fmt.Errorf("acquiring migrate advisory lock: %w", err)
 	}
 
 	if _, err := tx.Exec(ctx, migrateSQL); err != nil {
