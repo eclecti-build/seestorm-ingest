@@ -10,3 +10,13 @@ primary_region = "ord"  # Chicago - closest to Wisconsin
 [mounts]
   source = "seestorm_data"
   destination = "/data"
+
+[checks]
+  [checks.ingest_health]
+    type = "http"
+    port = 8080
+    method = "get"
+    path = "/healthz"
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "60s"

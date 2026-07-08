@@ -96,4 +96,18 @@ const (
 	// withBudgetFraction and this task's "retry budget fairness" design
 	// decision.
 	SPCFetchBudgetPercent = 20
+
+	// HealthPort is the TCP port the /healthz HTTP server listens on
+	// inside the Fly Machine. Not exposed via any [[services]]/
+	// [http_service] block in fly.toml — only Fly's internal top-level
+	// [checks] mechanism (private networking) reaches it.
+	HealthPort = 8080
+
+	// HealthStalenessMultiplier is how many PollIntervals a required feed
+	// may go without a recorded success before /healthz reports it stale.
+	// 3x tolerates the ~7% single-missed-tick rate poller.Run already logs
+	// as normal (see its doc comment) without flapping the health check;
+	// 3 consecutive misses (90s at the default 30s interval) is well past
+	// that noise floor and is the point an operator should be paged.
+	HealthStalenessMultiplier = 3
 )

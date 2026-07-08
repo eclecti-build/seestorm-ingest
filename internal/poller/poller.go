@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/eclecti-build/seestorm-ingest/internal/config"
+	"github.com/eclecti-build/seestorm-ingest/internal/health"
 	"github.com/eclecti-build/seestorm-ingest/internal/nws"
 	"github.com/eclecti-build/seestorm-ingest/internal/publisher"
 	"github.com/eclecti-build/seestorm-ingest/internal/spc"
@@ -30,6 +31,10 @@ type Config struct {
 	// Mode selects which phases of the cycle this node runs (ingest, publish,
 	// or both). The zero value behaves as ModeBoth. See Mode.
 	Mode Mode
+	// Health records per-feed last-success timestamps for /healthz. Safe
+	// to leave nil (health.Registry's methods are nil-receiver-safe) —
+	// existing/future unit tests that build a bare Config don't need it.
+	Health *health.Registry
 	// jitterFunc overrides startup-jitter delay computation for tests.
 	// nil in production, which uses startupJitter's real math/rand/v2
 	// implementation. Unexported: only this package's own tests can set
@@ -349,6 +354,7 @@ func (p *Poller) pollAlerts(ctx context.Context) (count int, skippedUnparseable 
 		slog.ErrorContext(ctx, "failed to fetch alerts", "error", err)
 		return 0, 0
 	}
+	p.cfg.Health.RecordSuccess(health.FeedAlerts, time.Now())
 
 	// Batch upsert — whole-cycle round-trip count drops from O(n) per-alert
 	// statements to one transactional batch, keeping us under
@@ -382,6 +388,8 @@ func (p *Poller) pollStormReports(ctx context.Context) int {
 		slog.ErrorContext(ctx, "failed to fetch tornado reports", "error", err)
 		// A tornado-feed failure shouldn't kill hail + wind ingest — keep going.
 		reports = nil
+	} else {
+		p.cfg.Health.RecordSuccess(health.FeedSPCTorn, time.Now())
 	}
 
 	hailCtx, hailCancel := withBudgetFraction(ctx, config.SPCFetchBudgetPercent)
@@ -390,6 +398,7 @@ func (p *Poller) pollStormReports(ctx context.Context) int {
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to fetch hail reports", "error", err)
 	} else {
+		p.cfg.Health.RecordSuccess(health.FeedSPCHail, time.Now())
 		reports = append(reports, hailReports...)
 	}
 
@@ -399,6 +408,7 @@ func (p *Poller) pollStormReports(ctx context.Context) int {
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to fetch wind reports", "error", err)
 	} else {
+		p.cfg.Health.RecordSuccess(health.FeedSPCWind, time.Now())
 		reports = append(reports, windReports...)
 	}
 
@@ -444,6 +454,8 @@ func (p *Poller) publishSnapshot(ctx context.Context) {
 	p.publishWithTimeout(ctx, "merged", "", func(timeoutCtx context.Context) error {
 		return p.cfg.Publisher.Publish(timeoutCtx, snapshot)
 	})
+	// TEMPORARY (Tier 2 Task 4): recorded unconditionally — publishWithTimeout swallows its error, so FeedPublish stays green even if the merged publish failed. Task 6 replaces publishWithTimeout with publishWithRetry and gates this on actual success.
+	p.cfg.Health.RecordSuccess(health.FeedPublish, time.Now())
 
 	// Per-state snapshots — one per configured area, written to
 	// active-events/<STATE>.json. Cross-border alerts (states ⊃ {STATE})
