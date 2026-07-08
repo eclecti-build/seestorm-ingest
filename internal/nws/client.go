@@ -3,10 +3,12 @@ package nws
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/eclecti-build/seestorm-ingest/internal/config"
@@ -17,7 +19,17 @@ type Client struct {
 	httpClient *http.Client
 	userAgent  string
 	baseURL    string
+
+	etagMu sync.Mutex
+	etags  map[string]string // endpoint -> last-seen ETag
 }
+
+// ErrNotModified is returned by FetchActiveAlerts when the upstream
+// responds 304 Not Modified to a conditional (If-None-Match) request.
+// Callers must treat this as "fetch succeeded, nothing changed" — skip
+// decode + upsert, but still record fetch success (see
+// internal/health.Registry and internal/poller's classifyAlertFetchErr).
+var ErrNotModified = errors.New("nws: not modified (304)")
 
 func NewClient(userAgent string) *Client {
 	return &Client{
@@ -31,6 +43,7 @@ func NewClient(userAgent string) *Client {
 		},
 		userAgent: userAgent,
 		baseURL:   "https://api.weather.gov",
+		etags:     make(map[string]string),
 	}
 }
 
@@ -52,6 +65,10 @@ func (c *Client) FetchActiveAlerts(ctx context.Context, area string) (*AlertsRes
 	}
 	endpoint := fmt.Sprintf("%s/alerts/active?%s", c.baseURL, params.Encode())
 
+	c.etagMu.Lock()
+	lastETag := c.etags[endpoint]
+	c.etagMu.Unlock()
+
 	var lastErr error
 	for attempt := 0; attempt < retry.MaxAttempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
@@ -60,6 +77,9 @@ func (c *Client) FetchActiveAlerts(ctx context.Context, area string) (*AlertsRes
 		}
 		req.Header.Set("User-Agent", c.userAgent)
 		req.Header.Set("Accept", "application/geo+json")
+		if lastETag != "" {
+			req.Header.Set("If-None-Match", lastETag)
+		}
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
@@ -68,6 +88,11 @@ func (c *Client) FetchActiveAlerts(ctx context.Context, area string) (*AlertsRes
 				return nil, lastErr
 			}
 			continue
+		}
+
+		if resp.StatusCode == http.StatusNotModified {
+			_ = resp.Body.Close()
+			return nil, ErrNotModified
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -82,6 +107,16 @@ func (c *Client) FetchActiveAlerts(ctx context.Context, area string) (*AlertsRes
 				return nil, lastErr
 			}
 			continue
+		}
+
+		// 200 OK: capture the new ETag (if present) BEFORE decoding, so a
+		// decode failure still leaves us positioned to send a conditional
+		// request next cycle — a transient decode issue is not a reason to
+		// lose the freshness signal.
+		if newETag := resp.Header.Get("ETag"); newETag != "" {
+			c.etagMu.Lock()
+			c.etags[endpoint] = newETag
+			c.etagMu.Unlock()
 		}
 
 		// Cap upstream body size before decoding. A runaway or malicious NWS

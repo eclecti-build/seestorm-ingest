@@ -2,6 +2,7 @@ package poller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -338,6 +339,18 @@ func (p *Poller) poll(pollCtx context.Context) {
 	)
 }
 
+// classifyAlertFetchErr distinguishes "unchanged" (304 via
+// nws.ErrNotModified) from a real failure. Pure function so it — and
+// therefore the branching behavior pollAlerts relies on — is unit
+// testable without a live *nws.Client (NWS is a concrete field on
+// Config, not an interface; see this plan's "Corrections" section).
+func classifyAlertFetchErr(err error) (unchanged bool, realErr error) {
+	if errors.Is(err, nws.ErrNotModified) {
+		return true, nil
+	}
+	return false, err
+}
+
 func (p *Poller) pollAlerts(ctx context.Context) (count int, skippedUnparseable int) {
 	// Cap the alerts fetch (including any internal/retry retries) at
 	// AlertsFetchBudgetPercent of whatever fetch+store budget remains
@@ -350,8 +363,13 @@ func (p *Poller) pollAlerts(ctx context.Context) (count int, skippedUnparseable 
 	fetchCtx, fetchCancel := withBudgetFraction(ctx, config.AlertsFetchBudgetPercent)
 	alerts, err := p.cfg.NWS.FetchActiveAlerts(fetchCtx, strings.Join(p.cfg.Areas, ","))
 	fetchCancel()
-	if err != nil {
-		slog.ErrorContext(ctx, "failed to fetch alerts", "error", err)
+	if unchanged, realErr := classifyAlertFetchErr(err); unchanged {
+		// 304 Not Modified: upstream confirmed nothing changed. Still a
+		// successful fetch for health purposes — skip decode + upsert.
+		p.cfg.Health.RecordSuccess(health.FeedAlerts, time.Now())
+		return 0, 0
+	} else if realErr != nil {
+		slog.ErrorContext(ctx, "failed to fetch alerts", "error", realErr)
 		return 0, 0
 	}
 	p.cfg.Health.RecordSuccess(health.FeedAlerts, time.Now())
