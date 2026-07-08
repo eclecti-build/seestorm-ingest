@@ -26,6 +26,14 @@ func isFatalBatchErr(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
+// errSkipUnparseableExpires signals that UpsertAlert deliberately skipped
+// writing an alert because its `expires` timestamp failed to parse (see
+// parseAlertTimes). Not a real failure: UpsertAlertsBatch's fallback loop
+// checks for it via errors.Is so it neither double-logs (UpsertAlert
+// already logged the WARN with the offending raw value) nor counts/
+// retires the skipped row.
+var errSkipUnparseableExpires = errors.New("alert skipped: unparseable expires timestamp")
+
 type Store struct {
 	pool *pgxpool.Pool
 }
@@ -119,6 +127,16 @@ func (s *Store) Migrate(ctx context.Context) error {
 func (s *Store) UpsertAlert(ctx context.Context, alert nws.Alert) error {
 	props := alert.Properties
 
+	effectiveAt, expiresAt, ok := parseAlertTimes(props, time.Now().UTC())
+	if !ok {
+		slog.WarnContext(ctx, "skipping alert with unparseable expires timestamp",
+			"degraded_path", "unparseable_expires",
+			"nws_id", props.ID,
+			"raw_expires", props.Expires,
+		)
+		return errSkipUnparseableExpires
+	}
+
 	propsJSON, err := json.Marshal(props)
 	if err != nil {
 		return fmt.Errorf("marshaling properties: %w", err)
@@ -129,9 +147,6 @@ func (s *Store) UpsertAlert(ctx context.Context, alert nws.Alert) error {
 		s := string(alert.Geometry)
 		geomStr = &s
 	}
-
-	effectiveAt, _ := time.Parse(time.RFC3339, props.Effective)
-	expiresAt, _ := time.Parse(time.RFC3339, props.Expires)
 
 	_, err = s.pool.Exec(ctx, upsertAlertSQL,
 		props.ID,
@@ -159,28 +174,35 @@ func (s *Store) UpsertAlert(ctx context.Context, alert nws.Alert) error {
 // malformed alert doesn't cost us 19 good ones in the same cycle. See audit
 // Open Decisions #8 (whole-batch transaction first; degraded path logged).
 //
-// Returns (inserted, degraded, err). `inserted` counts successful upserts;
+// Returns (inserted, skipped, degraded, err). `inserted` counts successful
+// upserts. `skipped` counts alerts deliberately excluded for an unparseable
+// `expires` timestamp (parseAlertTimes/errSkipUnparseableExpires) — these
+// are NOT failures, so they never set `degraded` or `err`, but the poller
+// (internal/poller/poller.go) aggregates this into its per-cycle "poll
+// cycle complete" log line as alerts_skipped_unparseable, so a sustained
+// rise is visible without an operator grepping individual per-row WARNs.
 // `degraded` is true iff we took the per-alert fallback path. `err` is only
-// non-nil for ctx cancellation — individual row failures are logged and skipped.
-func (s *Store) UpsertAlertsBatch(ctx context.Context, alerts []nws.Alert) (int, bool, error) {
+// non-nil for ctx cancellation — individual row failures are logged and
+// skipped.
+func (s *Store) UpsertAlertsBatch(ctx context.Context, alerts []nws.Alert) (int, int, bool, error) {
 	if len(alerts) == 0 {
-		return 0, false, nil
+		return 0, 0, false, nil
 	}
 
 	// Happy path: single transaction, all-or-nothing for the commit itself.
-	inserted, err := s.upsertAlertsBatchTx(ctx, alerts)
+	inserted, skipped, err := s.upsertAlertsBatchTx(ctx, alerts)
 	if err == nil {
-		return inserted, false, nil
+		return inserted, skipped, false, nil
 	}
 	// Distinguish ctx/infra failure from data-shape failure. Context errors
 	// mean the cycle deadline fired or shutdown is in progress — retrying
 	// per-row against the same dead ctx just burns cycles and silently drops
 	// rows. Surface the ctx error instead of entering the fallback loop.
 	if isFatalBatchErr(err) {
-		return 0, false, err
+		return 0, 0, false, err
 	}
 	if ctx.Err() != nil {
-		return 0, false, ctx.Err()
+		return 0, 0, false, ctx.Err()
 	}
 
 	// Degraded path: the batch/tx failed (likely one malformed row poisoned
@@ -193,20 +215,21 @@ func (s *Store) UpsertAlertsBatch(ctx context.Context, alerts []nws.Alert) (int,
 	)
 
 	count := 0
+	skippedFallback := 0
 	succeeded := make([]nws.Alert, 0, len(alerts))
 	for _, alert := range alerts {
 		if err := s.UpsertAlert(ctx, alert); err != nil {
-			// If the ctx died mid-fallback (cycle deadline fired,
-			// shutdown signal), stop iterating and surface the error.
-			// Continuing would log O(remaining) identical failures and
-			// still end with degraded=true, which is worse than bailing.
 			if isFatalBatchErr(err) {
-				return count, true, err
+				return count, skippedFallback, true, err
 			}
-			slog.ErrorContext(ctx, "failed to upsert alert (fallback)",
-				"nws_id", alert.Properties.ID,
-				"error", err,
-			)
+			if errors.Is(err, errSkipUnparseableExpires) {
+				skippedFallback++
+			} else {
+				slog.ErrorContext(ctx, "failed to upsert alert (fallback)",
+					"nws_id", alert.Properties.ID,
+					"error", err,
+				)
+			}
 			continue
 		}
 		count++
@@ -225,36 +248,54 @@ func (s *Store) UpsertAlertsBatch(ctx context.Context, alerts []nws.Alert) (int,
 			"error", err,
 		)
 	}
-	return count, true, nil
+	return count, skippedFallback, true, nil
 }
 
 // upsertAlertsBatchTx runs the whole batch inside a single transaction. A
 // failure anywhere in Exec() results rolls the entire batch back — the caller
 // is expected to fall back to per-row inserts on error.
-func (s *Store) upsertAlertsBatchTx(ctx context.Context, alerts []nws.Alert) (int, error) {
+func (s *Store) upsertAlertsBatchTx(ctx context.Context, alerts []nws.Alert) (int, int, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return 0, fmt.Errorf("begin tx: %w", err)
+		return 0, 0, fmt.Errorf("begin tx: %w", err)
 	}
-	// Safe to call after a successful Commit — pgx makes Rollback a no-op
-	// once the tx is committed, which keeps the defer simple.
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	receivedAt := time.Now().UTC()
 	batch := &pgx.Batch{}
+	// queued mirrors exactly which alerts were added to the batch (excludes
+	// unparseable-expires skips), so the exec-result loop, retireReferenced,
+	// and the returned count all agree on the same set.
+	queued := make([]nws.Alert, 0, len(alerts))
+	skipped := 0
 	for _, alert := range alerts {
-		args, err := alertUpsertArgs(alert)
+		args, skip, err := alertUpsertArgs(alert, receivedAt)
 		if err != nil {
-			// A marshal failure pre-queue is a data-shape bug, not a DB
-			// issue. Abort the batch so the caller can drop into the
-			// per-row fallback path where the bad row's error is isolated.
-			return 0, fmt.Errorf("marshaling alert %s: %w", alert.Properties.ID, err)
+			return 0, 0, fmt.Errorf("marshaling alert %s: %w", alert.Properties.ID, err)
+		}
+		if skip {
+			slog.WarnContext(ctx, "skipping alert with unparseable expires timestamp",
+				"degraded_path", "unparseable_expires",
+				"nws_id", alert.Properties.ID,
+				"raw_expires", alert.Properties.Expires,
+			)
+			skipped++
+			continue
 		}
 		batch.Queue(upsertAlertSQL, args...)
+		queued = append(queued, alert)
+	}
+
+	if len(queued) == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return 0, skipped, fmt.Errorf("commit tx: %w", err)
+		}
+		return 0, skipped, nil
 	}
 
 	br := tx.SendBatch(ctx, batch)
 	var batchErr error
-	for range alerts {
+	for range queued {
 		if _, err := br.Exec(); err != nil && batchErr == nil {
 			batchErr = err
 		}
@@ -263,31 +304,68 @@ func (s *Store) upsertAlertsBatchTx(ctx context.Context, alerts []nws.Alert) (in
 		batchErr = closeErr
 	}
 	if batchErr != nil {
-		return 0, fmt.Errorf("batch exec: %w", batchErr)
+		// A mid-batch exec failure rolls back the WHOLE tx (including rows
+		// that individually parsed fine), so the `skipped` count computed
+		// above no longer corresponds to any committed state either —
+		// return 0 for both, matching the pre-existing "return 0 on error"
+		// convention below, and let the caller's per-row fallback loop
+		// (Step 6 above) recompute its own skip count from scratch.
+		return 0, 0, fmt.Errorf("batch exec: %w", batchErr)
 	}
 
 	// PR2: retire predecessors this batch supersedes, inside the SAME tx and
-	// AFTER the upserts (Decision 2 ordering) so a predecessor inserted in this
-	// very batch is correctly retired. Idempotent; gated on event_type.
-	if _, err := retireReferenced(ctx, tx, alerts); err != nil {
-		return 0, fmt.Errorf("retire referenced: %w", err)
+	// AFTER the upserts (Decision 2 ordering). Uses `queued`, not `alerts` —
+	// a skipped (unparseable-expires) alert never landed, so it must not
+	// retire whatever predecessor it references.
+	if _, err := retireReferenced(ctx, tx, queued); err != nil {
+		return 0, 0, fmt.Errorf("retire referenced: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("commit tx: %w", err)
+		return 0, 0, fmt.Errorf("commit tx: %w", err)
 	}
-	return len(alerts), nil
+	return len(queued), skipped, nil
+}
+
+// parseAlertTimes parses effective/expires for one alert. On an
+// unparseable `expires`, ok=false: the caller MUST skip writing this alert
+// entirely rather than persist the RFC3339 zero value (year 0001), which
+// would immediately satisfy activeAlertsSQL's `expires_at > NOW()` filter
+// (queries.go:107) as "already expired" and silently hide a live alert if
+// this nws_id already had a valid row. An unparseable `effective` is less
+// safety-critical — it's used for sort/display, not the active-alerts
+// visibility filter — so it falls back to `receivedAt` and ok stays true.
+func parseAlertTimes(
+	props nws.AlertProperties,
+	receivedAt time.Time,
+) (effectiveAt, expiresAt time.Time, ok bool) {
+	expiresAt, err := time.Parse(time.RFC3339, props.Expires)
+	if err != nil {
+		return time.Time{}, time.Time{}, false
+	}
+	effectiveAt, err = time.Parse(time.RFC3339, props.Effective)
+	if err != nil {
+		effectiveAt = receivedAt
+	}
+	return effectiveAt, expiresAt, true
 }
 
 // alertUpsertArgs extracts the parameter list for a single alert upsert.
-// Shared by the per-row path and the batch path so the argument order stays
-// in lockstep with upsertAlertSQL.
-func alertUpsertArgs(alert nws.Alert) ([]any, error) {
+// Shared by the per-row path and the batch path so the argument order
+// stays in lockstep with upsertAlertSQL. skip=true (args=nil, err=nil)
+// signals an unparseable-expires row that the caller must exclude from
+// the batch entirely rather than treat as an error — see parseAlertTimes.
+func alertUpsertArgs(alert nws.Alert, receivedAt time.Time) (args []any, skip bool, err error) {
 	props := alert.Properties
+
+	effectiveAt, expiresAt, ok := parseAlertTimes(props, receivedAt)
+	if !ok {
+		return nil, true, nil
+	}
 
 	propsJSON, err := json.Marshal(props)
 	if err != nil {
-		return nil, fmt.Errorf("marshaling properties: %w", err)
+		return nil, false, fmt.Errorf("marshaling properties: %w", err)
 	}
 
 	var geomStr *string
@@ -295,9 +373,6 @@ func alertUpsertArgs(alert nws.Alert) ([]any, error) {
 		s := string(alert.Geometry)
 		geomStr = &s
 	}
-
-	effectiveAt, _ := time.Parse(time.RFC3339, props.Effective)
-	expiresAt, _ := time.Parse(time.RFC3339, props.Expires)
 
 	return []any{
 		props.ID,
@@ -312,7 +387,7 @@ func alertUpsertArgs(alert nws.Alert) ([]any, error) {
 		propsJSON,
 		effectiveAt,
 		expiresAt,
-	}, nil
+	}, false, nil
 }
 
 // UpsertStormReportsBatch writes every storm report in a single transaction
