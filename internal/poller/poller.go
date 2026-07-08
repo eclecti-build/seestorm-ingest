@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -29,6 +30,11 @@ type Config struct {
 	// Mode selects which phases of the cycle this node runs (ingest, publish,
 	// or both). The zero value behaves as ModeBoth. See Mode.
 	Mode Mode
+	// jitterFunc overrides startup-jitter delay computation for tests.
+	// nil in production, which uses startupJitter's real math/rand/v2
+	// implementation. Unexported: only this package's own tests can set
+	// it — not part of the public Config surface cmd/ingest/main.go uses.
+	jitterFunc func(time.Duration) time.Duration
 }
 
 type Poller struct {
@@ -66,8 +72,31 @@ func pollSafely(ctx context.Context, fn func(context.Context)) {
 // to the next future tick rather than firing back-to-back catch-up polls —
 // so load never amplifies during upstream slowness.
 func (p *Poller) Run(ctx context.Context) error {
-	// Run immediately on start. Wrapped so a panic in any phase doesn't
-	// crash the process before the loop even starts.
+	// One-time random phase offset in [0, PollInterval) before the FIRST
+	// cycle only — NOT a per-cycle change. Without it, a fleet-wide
+	// redeploy leaves every node's absolute-time schedule (see this
+	// function's top-level doc comment) anchored to the same instant
+	// forever, so the 7 ingest-role apps hit NWS/SPC in lockstep every
+	// cycle indefinitely. The publisher is exempt (Poller.startupJitter
+	// returns 0 when Mode.ShouldIngest() is false, review amendment) — it
+	// never polls upstreams, so this rationale doesn't apply to it and
+	// jitter there would only add pure post-deploy staleness. The
+	// schedule that follows is still pure start + N*interval absolute-time
+	// scheduling — this only moves where `start` falls relative to the
+	// fleet-wide redeploy instant.
+	if jitter := p.startupJitter(); jitter > 0 {
+		slog.InfoContext(ctx, "poller startup jitter", "delay", jitter)
+		timer := time.NewTimer(jitter)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			slog.InfoContext(ctx, "shutting down poller during startup jitter")
+			return nil
+		case <-timer.C:
+		}
+	}
+
+	// Run immediately (post-jitter) on start.
 	pollSafely(ctx, p.poll)
 
 	start := time.Now()
@@ -132,6 +161,38 @@ func deriveCycleTimeout(interval time.Duration) time.Duration {
 	return derived
 }
 
+// startupJitter returns a random duration in [0, interval) used once as
+// an initial delay before the FIRST poll cycle, so a fleet-wide redeploy
+// (all 8 apps restarting within the same second) doesn't leave every
+// node's absolute-time schedule anchored to the same instant forever —
+// this loop never re-jitters after the first cycle, so without this a
+// lockstep fleet stays locked in step indefinitely, all 8 hitting
+// NWS/SPC at the same moment every cycle. math/rand/v2 is auto-seeded,
+// so this is intentionally non-deterministic across process restarts;
+// Config.jitterFunc overrides it for deterministic tests.
+func startupJitter(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(interval)))
+}
+
+func (p *Poller) startupJitter() time.Duration {
+	// Publish-only nodes never poll NWS/SPC (Mode.ShouldIngest() is
+	// false) — the lockstep-avoidance rationale above (de-sync the 8
+	// fleet nodes' upstream polling after a fleet-wide redeploy) doesn't
+	// apply to them. Applying jitter anyway would only add up to
+	// PollInterval of pure post-deploy staleness on the merged/history R2
+	// snapshot for zero benefit (review amendment).
+	if !p.cfg.Mode.ShouldIngest() {
+		return 0
+	}
+	if p.cfg.jitterFunc != nil {
+		return p.cfg.jitterFunc(p.cfg.PollInterval)
+	}
+	return startupJitter(p.cfg.PollInterval)
+}
+
 // splitCycleBudget divides the per-cycle wall-clock budget into a fetch+store
 // phase budget and a separate publish-phase budget. The publish phase aims
 // for PublishPhaseBudgetSec (15s) regardless of how long fetch+store took,
@@ -165,6 +226,28 @@ func splitCycleBudget(cycleTimeout time.Duration) (fetchStoreBudget, publishBudg
 		fetchStoreBudget = phaseFloor
 	}
 	return fetchStoreBudget, publishBudget
+}
+
+// withBudgetFraction derives a child context capped at pct percent of
+// ctx's CURRENTLY REMAINING time until its deadline — not a fixed
+// fraction of the whole phase, since "remaining" shrinks as earlier
+// fetches in the same phase consume time. If ctx has no deadline (not
+// expected in production — poll always derives fetchStoreCtx with
+// context.WithTimeout — but kept safe for tests/callers that pass a bare
+// context.Background()), returns a cancelable copy of ctx unchanged so
+// callers still get a valid CancelFunc to defer. See this task's "retry
+// budget fairness" design decision.
+func withBudgetFraction(ctx context.Context, pct int) (context.Context, context.CancelFunc) {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return context.WithCancel(ctx)
+	}
+	remaining := time.Until(dl)
+	if remaining <= 0 {
+		return context.WithDeadline(ctx, dl)
+	}
+	capped := time.Duration(int64(remaining) * int64(pct) / 100)
+	return context.WithTimeout(ctx, capped)
 }
 
 // poll runs one polling cycle. The cycle runs under a derived cycleTimeout
@@ -251,9 +334,17 @@ func (p *Poller) poll(pollCtx context.Context) {
 }
 
 func (p *Poller) pollAlerts(ctx context.Context) (count int, skippedUnparseable int) {
-	// NWS supports a comma-separated `area` value natively, so multi-state
-	// polling is one request rather than N. See nws.FetchActiveAlerts docs.
-	alerts, err := p.cfg.NWS.FetchActiveAlerts(ctx, strings.Join(p.cfg.Areas, ","))
+	// Cap the alerts fetch (including any internal/retry retries) at
+	// AlertsFetchBudgetPercent of whatever fetch+store budget remains
+	// right now. Alerts fetches first among this phase's upstream calls
+	// — without this cap, a slow/retrying NWS could consume the ENTIRE
+	// fetch+store budget and starve the three SPC CSV fetches and the
+	// store-upsert step below (review amendment; see withBudgetFraction).
+	// The store-upsert call keeps using ctx directly, NOT this
+	// sub-context, so it always gets whatever's left of the real budget.
+	fetchCtx, fetchCancel := withBudgetFraction(ctx, config.AlertsFetchBudgetPercent)
+	alerts, err := p.cfg.NWS.FetchActiveAlerts(fetchCtx, strings.Join(p.cfg.Areas, ","))
+	fetchCancel()
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to fetch alerts", "error", err)
 		return 0, 0
@@ -284,22 +375,27 @@ func (p *Poller) pollAlerts(ctx context.Context) (count int, skippedUnparseable 
 }
 
 func (p *Poller) pollStormReports(ctx context.Context) int {
-	reports, err := p.cfg.SPC.FetchTodayTornadoReports(ctx)
+	tornCtx, tornCancel := withBudgetFraction(ctx, config.SPCFetchBudgetPercent)
+	reports, err := p.cfg.SPC.FetchTodayTornadoReports(tornCtx)
+	tornCancel()
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to fetch tornado reports", "error", err)
 		// A tornado-feed failure shouldn't kill hail + wind ingest — keep going.
 		reports = nil
 	}
 
-	// Also fetch hail and wind
-	hailReports, err := p.cfg.SPC.FetchTodayHailReports(ctx)
+	hailCtx, hailCancel := withBudgetFraction(ctx, config.SPCFetchBudgetPercent)
+	hailReports, err := p.cfg.SPC.FetchTodayHailReports(hailCtx)
+	hailCancel()
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to fetch hail reports", "error", err)
 	} else {
 		reports = append(reports, hailReports...)
 	}
 
-	windReports, err := p.cfg.SPC.FetchTodayWindReports(ctx)
+	windCtx, windCancel := withBudgetFraction(ctx, config.SPCFetchBudgetPercent)
+	windReports, err := p.cfg.SPC.FetchTodayWindReports(windCtx)
+	windCancel()
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to fetch wind reports", "error", err)
 	} else {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/eclecti-build/seestorm-ingest/internal/config"
+	"github.com/eclecti-build/seestorm-ingest/internal/retry"
 )
 
 type Client struct {
@@ -45,25 +46,68 @@ func (c *Client) FetchTodayWindReports(ctx context.Context) ([]StormReport, erro
 func (c *Client) fetchReports(ctx context.Context, file string, reportType string) ([]StormReport, error) {
 	endpoint := fmt.Sprintf("%s/%s", c.baseURL, file)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
-	}
+	var lastErr error
+	for attempt := 0; attempt < retry.MaxAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, fmt.Errorf("creating request: %w", err)
+		}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetching %s: %w", file, err)
-	}
-	defer resp.Body.Close()
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("fetching %s: %w", file, err)
+			if !c.retryAfterErr(ctx, attempt) {
+				return nil, lastErr
+			}
+			continue
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("SPC returned %d for %s", resp.StatusCode, file)
-	}
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			lastErr = fmt.Errorf("SPC returned %d for %s", resp.StatusCode, file)
+			if !retry.IsRetryableStatus(resp.StatusCode) {
+				return nil, lastErr
+			}
+			retryAfter, hasRA := retry.ParseRetryAfter(resp.Header.Get("Retry-After"))
+			if !c.retryAfterResp(ctx, attempt, retryAfter, hasRA) {
+				return nil, lastErr
+			}
+			continue
+		}
 
-	// Cap upstream body size before parsing. Prevents a runaway CSV from
-	// exhausting memory; csv.Reader sees io.EOF at the cap and the caller
-	// handles the partial-read error without wedging the pool.
-	return parseCSVReports(io.LimitReader(resp.Body, config.SPCResponseMaxBytes), reportType)
+		defer resp.Body.Close()
+
+		// Cap upstream body size before parsing. Prevents a runaway CSV from
+		// exhausting memory; csv.Reader sees io.EOF at the cap and the caller
+		// handles the partial-read error without wedging the pool.
+		return parseCSVReports(io.LimitReader(resp.Body, config.SPCResponseMaxBytes), reportType)
+	}
+	return nil, lastErr
+}
+
+// retryAfterErr and retryAfterResp both return false when the caller
+// should stop retrying (attempts exhausted or ctx budget too tight) and
+// true after successfully sleeping through the computed backoff.
+func (c *Client) retryAfterErr(ctx context.Context, attempt int) bool {
+	if attempt == retry.MaxAttempts-1 {
+		return false
+	}
+	delay, ok := retry.NextDelay(ctx, attempt, 0, false)
+	if !ok {
+		return false
+	}
+	return retry.Sleep(ctx, delay) == nil
+}
+
+func (c *Client) retryAfterResp(ctx context.Context, attempt int, retryAfter time.Duration, hasRetryAfter bool) bool {
+	if attempt == retry.MaxAttempts-1 {
+		return false
+	}
+	delay, ok := retry.NextDelay(ctx, attempt, retryAfter, hasRetryAfter)
+	if !ok {
+		return false
+	}
+	return retry.Sleep(ctx, delay) == nil
 }
 
 func parseCSVReports(r io.Reader, reportType string) ([]StormReport, error) {
