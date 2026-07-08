@@ -70,7 +70,12 @@ func run() error {
 	// publisher. Unset defaults to "both" (poll + publish), preserving the
 	// historical single-node behavior. An invalid value fails fast rather than
 	// silently falling back to "both" — see poller.ParseMode.
-	mode, err := poller.ParseMode(os.Getenv("MODE"))
+	rawMode := os.Getenv("MODE")
+	if err := requireExplicitModeOnFly(os.Getenv("FLY_APP_NAME"), rawMode); err != nil {
+		return err
+	}
+
+	mode, err := poller.ParseMode(rawMode)
 	if err != nil {
 		return err
 	}
@@ -175,4 +180,26 @@ func parseAreas(raw string) []string {
 		out = append(out, code)
 	}
 	return out
+}
+
+// requireExplicitModeOnFly returns an error when running on Fly
+// (FLY_APP_NAME set, which Fly always sets) without an explicit MODE
+// secret. Fly's fleet model relies on MODE to split region-scoped
+// ingesters from the single publisher (see poller.Mode's docs);
+// ParseMode's empty->"both" default is correct for local dev but would
+// silently turn a regional app into a second publisher if its MODE secret
+// were ever missing — reintroducing the 2026-05 history-amplification
+// incident (poller/mode.go:8-14). Local dev (no FLY_APP_NAME) is
+// unaffected and keeps the "both" default.
+func requireExplicitModeOnFly(flyAppName, rawMode string) error {
+	if flyAppName == "" {
+		return nil
+	}
+	if strings.TrimSpace(rawMode) != "" {
+		return nil
+	}
+	return fmt.Errorf(
+		"MODE is required when running on Fly (FLY_APP_NAME=%q) but is unset; fix: fly secrets set MODE=ingest -a %s (or MODE=publish for the single publisher app)",
+		flyAppName, flyAppName,
+	)
 }

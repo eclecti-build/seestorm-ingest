@@ -71,7 +71,7 @@ func TestUpsertAlertsBatch_PartialFailure_FallsBackAndWritesRemainder(t *testing
 		good("test-batch-fallback-2"),
 	}
 
-	count, degraded, err := s.UpsertAlertsBatch(ctx, alerts)
+	count, skipped, degraded, err := s.UpsertAlertsBatch(ctx, alerts)
 	if err != nil {
 		t.Fatalf("UpsertAlertsBatch returned err: %v", err)
 	}
@@ -82,6 +82,9 @@ func TestUpsertAlertsBatch_PartialFailure_FallsBackAndWritesRemainder(t *testing
 	// also fails and is logged+skipped — count should be 2.
 	if count != 2 {
 		t.Errorf("fallback inserted count: got %d want 2", count)
+	}
+	if skipped != 0 {
+		t.Errorf("skipped = %d, want 0", skipped)
 	}
 
 	// Verify the good rows actually made it to the DB.
@@ -139,7 +142,7 @@ func TestUpsertAlertsBatch_HappyPath_WritesEveryRowInOneTx(t *testing.T) {
 		})
 	}
 
-	count, degraded, err := s.UpsertAlertsBatch(ctx, alerts)
+	count, skipped, degraded, err := s.UpsertAlertsBatch(ctx, alerts)
 	if err != nil {
 		t.Fatalf("happy-path batch err: %v", err)
 	}
@@ -148,6 +151,9 @@ func TestUpsertAlertsBatch_HappyPath_WritesEveryRowInOneTx(t *testing.T) {
 	}
 	if count != len(alerts) {
 		t.Errorf("inserted count: got %d want %d", count, len(alerts))
+	}
+	if skipped != 0 {
+		t.Errorf("skipped = %d, want 0", skipped)
 	}
 
 	if _, err := s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-batch-happy-%'"); err != nil {
@@ -199,7 +205,7 @@ func TestUpsertAlertsBatch_CtxCanceled_ShortCircuits(t *testing.T) {
 		},
 	}
 
-	count, degraded, err := s.UpsertAlertsBatch(ctx, alerts)
+	count, skipped, degraded, err := s.UpsertAlertsBatch(ctx, alerts)
 	if err == nil {
 		t.Fatal("expected ctx error to propagate, got nil")
 	}
@@ -212,6 +218,9 @@ func TestUpsertAlertsBatch_CtxCanceled_ShortCircuits(t *testing.T) {
 	}
 	if count != 0 {
 		t.Errorf("expected count=0 on ctx cancellation, got %d", count)
+	}
+	if skipped != 0 {
+		t.Errorf("skipped = %d, want 0", skipped)
 	}
 }
 
@@ -409,4 +418,283 @@ func TestUpsertStormReportsBatch_CtxCanceled_ShortCircuits(t *testing.T) {
 	if count != 0 {
 		t.Errorf("expected count=0 on ctx cancellation, got %d", count)
 	}
+}
+
+// TestUpsertAlertsBatch_UnparseableExpires_SkipsRowAndPreservesPrior locks
+// in the Tier 1 (2026-07-08) fix: a malformed `expires` on an UPDATE to an
+// existing alert must not overwrite its still-valid row with the RFC3339
+// zero value (which activeAlertsSQL's `expires_at > NOW()` filter would
+// treat as already-expired, silently hiding a live alert).
+func TestUpsertAlertsBatch_UnparseableExpires_SkipsRowAndPreservesPrior(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set — skipping integration test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	s, err := New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer s.Close()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-ts-skip-%'")
+
+	originalExpires := time.Now().UTC().Add(1 * time.Hour)
+	original := nws.Alert{
+		Properties: nws.AlertProperties{
+			ID:        "test-ts-skip-1",
+			Event:     "Tornado Warning",
+			Severity:  "Extreme",
+			AreaDesc:  "Test County, WI",
+			Effective: time.Now().UTC().Format(time.RFC3339),
+			Expires:   originalExpires.Format(time.RFC3339),
+		},
+		Geometry: json.RawMessage(`null`),
+	}
+	count, skipped, degraded, err := s.UpsertAlertsBatch(ctx, []nws.Alert{original})
+	if err != nil || degraded || count != 1 || skipped != 0 {
+		t.Fatalf("seed insert: count=%d skipped=%d degraded=%v err=%v", count, skipped, degraded, err)
+	}
+
+	// Same nws_id, malformed expires, alongside one unrelated good alert in
+	// the SAME batch — this must NOT fall back to per-row for the whole
+	// batch; the bad row is excluded before queuing.
+	malformedUpdate := original
+	malformedUpdate.Properties.Expires = "not-a-timestamp"
+	good := nws.Alert{
+		Properties: nws.AlertProperties{
+			ID:        "test-ts-skip-2",
+			Event:     "Severe Thunderstorm Warning",
+			Severity:  "Severe",
+			AreaDesc:  "Test County, WI",
+			Effective: time.Now().UTC().Format(time.RFC3339),
+			Expires:   time.Now().UTC().Add(1 * time.Hour).Format(time.RFC3339),
+		},
+		Geometry: json.RawMessage(`null`),
+	}
+	count, skipped, degraded, err = s.UpsertAlertsBatch(ctx, []nws.Alert{malformedUpdate, good})
+	if err != nil {
+		t.Fatalf("UpsertAlertsBatch returned err: %v", err)
+	}
+	if degraded {
+		t.Error("expected degraded=false — the skip must not force the per-row fallback")
+	}
+	if count != 1 {
+		t.Errorf("count: got %d want 1 (only the good alert)", count)
+	}
+	// REVIEW AMENDMENT: aggregate skip count — one alert in this batch
+	// (malformedUpdate) is skipped for an unparseable expires.
+	if skipped != 1 {
+		t.Errorf("skipped: got %d want 1", skipped)
+	}
+
+	var expiresAt time.Time
+	if err := s.pool.QueryRow(ctx,
+		"SELECT expires_at FROM weather_events WHERE nws_id = 'test-ts-skip-1'",
+	).Scan(&expiresAt); err != nil {
+		t.Fatalf("query original row: %v", err)
+	}
+	if expiresAt.Year() <= 1 {
+		t.Fatalf("original row was overwritten with the zero value: %v", expiresAt)
+	}
+	if expiresAt.Sub(originalExpires).Abs() > time.Second {
+		t.Errorf("original row's expires_at changed: got %v want ~%v", expiresAt, originalExpires)
+	}
+
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM weather_events WHERE nws_id = 'test-ts-skip-2'",
+	).Scan(&n); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("good alert in the same batch: got %d rows want 1", n)
+	}
+
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-ts-skip-%'")
+}
+
+// TestUpsertAlert_UnparseableExpires_ReturnsSkipSentinel exercises the
+// per-row path directly (the fallback branch UpsertAlertsBatch calls into).
+func TestUpsertAlert_UnparseableExpires_ReturnsSkipSentinel(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set — skipping integration test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	s, err := New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer s.Close()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id = 'test-ts-direct-skip'")
+
+	alert := nws.Alert{
+		Properties: nws.AlertProperties{
+			ID:        "test-ts-direct-skip",
+			Event:     "Flood Advisory",
+			Severity:  "Minor",
+			AreaDesc:  "Test County, WI",
+			Effective: time.Now().UTC().Format(time.RFC3339),
+			Expires:   "garbage",
+		},
+		Geometry: json.RawMessage(`null`),
+	}
+	err = s.UpsertAlert(ctx, alert)
+	if !errors.Is(err, errSkipUnparseableExpires) {
+		t.Fatalf("UpsertAlert error = %v, want errSkipUnparseableExpires", err)
+	}
+
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM weather_events WHERE nws_id = 'test-ts-direct-skip'",
+	).Scan(&n); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected no row written, got %d", n)
+	}
+}
+
+// TestUpsertAlertsBatch_UnparseableEffective_FallsBackToReceivedAt confirms
+// the LESS-critical field still inserts the row (not skipped), using the
+// receive time as a fallback rather than the zero value.
+func TestUpsertAlertsBatch_UnparseableEffective_FallsBackToReceivedAt(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set — skipping integration test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	s, err := New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer s.Close()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id = 'test-ts-bad-effective'")
+
+	before := time.Now().UTC()
+	alert := nws.Alert{
+		Properties: nws.AlertProperties{
+			ID:        "test-ts-bad-effective",
+			Event:     "Winter Weather Advisory",
+			Severity:  "Minor",
+			AreaDesc:  "Test County, WI",
+			Effective: "not-a-timestamp",
+			Expires:   time.Now().UTC().Add(1 * time.Hour).Format(time.RFC3339),
+		},
+		Geometry: json.RawMessage(`null`),
+	}
+	count, skipped, degraded, err := s.UpsertAlertsBatch(ctx, []nws.Alert{alert})
+	after := time.Now().UTC()
+	if err != nil || degraded || count != 1 || skipped != 0 {
+		t.Fatalf("count=%d skipped=%d degraded=%v err=%v", count, skipped, degraded, err)
+	}
+
+	var effectiveAt time.Time
+	if err := s.pool.QueryRow(ctx,
+		"SELECT effective_at FROM weather_events WHERE nws_id = 'test-ts-bad-effective'",
+	).Scan(&effectiveAt); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if effectiveAt.Before(before) || effectiveAt.After(after) {
+		t.Errorf("effective_at = %v, want within [%v, %v] (received-time fallback)", effectiveAt, before, after)
+	}
+
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id = 'test-ts-bad-effective'")
+}
+
+// TestUpsertAlertsBatch_UnparseableExpires_ReturnsAggregateSkippedCount is
+// the REVIEW AMENDMENT dedicated to the aggregate-count return value: a
+// batch containing exactly 2 bad-expires alerts (and nothing else) must
+// report skipped=2, count=0, degraded=false, err=nil — this is the count
+// that flows up into poller.go's "poll cycle complete" log line as
+// alerts_skipped_unparseable (see Steps 13-14 below).
+func TestUpsertAlertsBatch_UnparseableExpires_ReturnsAggregateSkippedCount(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set — skipping integration test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	s, err := New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer s.Close()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-ts-agg-%'")
+
+	bad1 := nws.Alert{
+		Properties: nws.AlertProperties{
+			ID:        "test-ts-agg-1",
+			Event:     "Flood Warning",
+			Severity:  "Severe",
+			AreaDesc:  "Test County, WI",
+			Effective: time.Now().UTC().Format(time.RFC3339),
+			Expires:   "not-a-timestamp",
+		},
+		Geometry: json.RawMessage(`null`),
+	}
+	bad2 := nws.Alert{
+		Properties: nws.AlertProperties{
+			ID:        "test-ts-agg-2",
+			Event:     "Flood Warning",
+			Severity:  "Severe",
+			AreaDesc:  "Test County, WI",
+			Effective: time.Now().UTC().Format(time.RFC3339),
+			Expires:   "",
+		},
+		Geometry: json.RawMessage(`null`),
+	}
+
+	count, skipped, degraded, err := s.UpsertAlertsBatch(ctx, []nws.Alert{bad1, bad2})
+	if err != nil {
+		t.Fatalf("UpsertAlertsBatch returned err: %v", err)
+	}
+	if degraded {
+		t.Error("expected degraded=false — an all-skipped batch is a happy path, not a fallback")
+	}
+	if count != 0 {
+		t.Errorf("count: got %d want 0", count)
+	}
+	if skipped != 2 {
+		t.Errorf("skipped: got %d want 2", skipped)
+	}
+
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM weather_events WHERE nws_id LIKE 'test-ts-agg-%'",
+	).Scan(&n); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected no rows written for an all-skipped batch, got %d", n)
+	}
+
+	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-ts-agg-%'")
 }

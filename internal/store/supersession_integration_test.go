@@ -72,11 +72,11 @@ func TestRetire_SupersededPredecessorRetired(t *testing.T) {
 	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-pr2-retire-%'")
 
 	x := alertNoVTEC("test-pr2-retire-x", "Flood Warning", "Dane, WI")
-	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
+	if _, _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
 		t.Fatalf("upsert x: %v", err)
 	}
 	y := alertNoVTEC("test-pr2-retire-y", "Flood Warning", "Dane, WI", "test-pr2-retire-x")
-	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{y}); err != nil {
+	if _, _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{y}); err != nil {
 		t.Fatalf("upsert y: %v", err)
 	}
 
@@ -100,10 +100,10 @@ func TestRetire_EventTypeMismatchKeepsRow(t *testing.T) {
 	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-pr2-mismatch-%'")
 
 	x := alertNoVTEC("test-pr2-mismatch-x", "Tornado Warning", "Dane, WI")
-	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{x})
+	_, _, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{x})
 	// Y is a different product that merely references X.
 	y := alertNoVTEC("test-pr2-mismatch-y", "Special Weather Statement", "Dane, WI", "test-pr2-mismatch-x")
-	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{y})
+	_, _, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{y})
 
 	if retiredAt(ctx, t, s, "test-pr2-mismatch-x") != nil {
 		t.Errorf("x must NOT be retired across a different event_type (fail-safe)")
@@ -116,7 +116,7 @@ func TestRetire_MissingReferenceIsNoOp(t *testing.T) {
 	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-pr2-missing-%'")
 
 	y := alertNoVTEC("test-pr2-missing-y", "Flood Warning", "Dane, WI", "test-pr2-missing-ghost")
-	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{y}); err != nil {
+	if _, _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{y}); err != nil {
 		t.Fatalf("upsert y referencing a never-ingested id should not error: %v", err)
 	}
 	if retiredAt(ctx, t, s, "test-pr2-missing-y") != nil {
@@ -132,7 +132,7 @@ func TestRetire_SameBatchOrdering(t *testing.T) {
 
 	x := alertNoVTEC("test-pr2-order-x", "Flood Warning", "Dane, WI")
 	y := alertNoVTEC("test-pr2-order-y", "Flood Warning", "Dane, WI", "test-pr2-order-x")
-	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x, y}); err != nil {
+	if _, _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x, y}); err != nil {
 		t.Fatalf("upsert batch: %v", err)
 	}
 	if retiredAt(ctx, t, s, "test-pr2-order-x") == nil {
@@ -148,7 +148,7 @@ func TestRetire_FallbackPathRetires(t *testing.T) {
 
 	// Seed the predecessor in its own clean batch.
 	x := alertNoVTEC("test-pr2-fallback-x", "Flood Warning", "Dane, WI")
-	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
+	if _, _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
 		t.Fatalf("seed x: %v", err)
 	}
 
@@ -158,7 +158,7 @@ func TestRetire_FallbackPathRetires(t *testing.T) {
 	poisoned.Geometry = json.RawMessage(`{"type":"NotAGeometry"}`)
 	good := alertNoVTEC("test-pr2-fallback-y", "Flood Warning", "Dane, WI", "test-pr2-fallback-x")
 
-	_, degraded, err := s.UpsertAlertsBatch(ctx, []nws.Alert{poisoned, good})
+	_, _, degraded, err := s.UpsertAlertsBatch(ctx, []nws.Alert{poisoned, good})
 	if err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
@@ -178,14 +178,14 @@ func TestRetire_ReinsertKeepsRetired(t *testing.T) {
 
 	x := alertNoVTEC("test-pr2-reinsert-x", "Flood Warning", "Dane, WI")
 	y := alertNoVTEC("test-pr2-reinsert-y", "Flood Warning", "Dane, WI", "test-pr2-reinsert-x")
-	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{x})
-	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{y})
+	_, _, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{x})
+	_, _, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{y})
 	if retiredAt(ctx, t, s, "test-pr2-reinsert-x") == nil {
 		t.Fatalf("precondition: x should be retired")
 	}
 
 	// Stale re-upsert of x (same id) — must keep retired_at set.
-	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
+	if _, _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
 		t.Fatalf("re-upsert x: %v", err)
 	}
 	if retiredAt(ctx, t, s, "test-pr2-reinsert-x") == nil {
@@ -199,9 +199,9 @@ func TestRetire_Idempotent(t *testing.T) {
 	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-pr2-idem-%'")
 
 	x := alertNoVTEC("test-pr2-idem-x", "Flood Warning", "Dane, WI")
-	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{x})
+	_, _, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{x})
 	y := alertNoVTEC("test-pr2-idem-y", "Flood Warning", "Dane, WI", "test-pr2-idem-x")
-	_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{y})
+	_, _, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{y})
 	first := retiredAt(ctx, t, s, "test-pr2-idem-x")
 
 	// Apply the same retirement again directly; row count affected should be 0.
@@ -231,7 +231,7 @@ func TestPurgeExpired(t *testing.T) {
 		alertNoVTEC("test-pr2-purge-retiredlive", "Flood Warning", "Dane, WI"),
 		alertNoVTEC("test-pr2-purge-expired", "Flood Warning", "Dane, WI"),
 	} {
-		_, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{a})
+		_, _, _, _ = s.UpsertAlertsBatch(ctx, []nws.Alert{a})
 	}
 	// Make retiredlive retired-but-unexpired, and expired naturally expired.
 	_, _ = s.pool.Exec(ctx, "UPDATE weather_events SET retired_at = NOW() WHERE nws_id = 'test-pr2-purge-retiredlive'")
@@ -269,7 +269,7 @@ func TestRetire_FallbackPoisonedReferencerKeepsPredecessor(t *testing.T) {
 
 	// Seed predecessor X in a clean batch.
 	x := alertNoVTEC("test-pr2-poisonref-x", "Flood Warning", "Dane, WI")
-	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
+	if _, _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
 		t.Fatalf("seed x: %v", err)
 	}
 
@@ -281,7 +281,7 @@ func TestRetire_FallbackPoisonedReferencerKeepsPredecessor(t *testing.T) {
 	y := alertNoVTEC("test-pr2-poisonref-y", "Flood Warning", "Dane, WI", "test-pr2-poisonref-x")
 	y.Geometry = json.RawMessage(`{"type":"NotAGeometry"}`)
 
-	_, degraded, err := s.UpsertAlertsBatch(ctx, []nws.Alert{poison, y})
+	_, _, degraded, err := s.UpsertAlertsBatch(ctx, []nws.Alert{poison, y})
 	if err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
@@ -306,12 +306,12 @@ func TestRetire_OutOfOrderArrival_AcceptedLeak(t *testing.T) {
 
 	// Y arrives first, referencing an X that is not in the DB yet.
 	y := alertNoVTEC("test-pr2-ooo-y", "Flood Warning", "Dane, WI", "test-pr2-ooo-x")
-	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{y}); err != nil {
+	if _, _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{y}); err != nil {
 		t.Fatalf("upsert y: %v", err)
 	}
 	// X arrives late with a different footprint and no VTEC.
 	x := alertNoVTEC("test-pr2-ooo-x", "Flood Warning", "Sauk, WI")
-	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
+	if _, _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
 		t.Fatalf("upsert x: %v", err)
 	}
 
@@ -337,7 +337,7 @@ func TestSchema_RetiredRowExcludedFromSnapshot(t *testing.T) {
 	_, _ = s.pool.Exec(ctx, "DELETE FROM weather_events WHERE nws_id LIKE 'test-pr2-schema-%'")
 
 	x := alertNoVTEC("test-pr2-schema-x", "Flood Warning", "Dane, WI")
-	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
+	if _, _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{x}); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 
@@ -383,14 +383,14 @@ func TestRetire_RealWorld_SVRtoSVSContinuation(t *testing.T) {
 	neu := withVTEC("test-pr2-svrsvs-new",
 		"Maries, MO; Miller, MO; Phelps, MO; Pulaski, MO",
 		"/O.NEW.KSGF.SV.W.0235.260531T1712Z-260531T1815Z/")
-	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{neu}); err != nil {
+	if _, _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{neu}); err != nil {
 		t.Fatalf("upsert NEW: %v", err)
 	}
 
 	// Continuation references the NEW message; footprint shrinks to Phelps.
 	con := withVTEC("test-pr2-svrsvs-con", "Phelps, MO",
 		"/O.CON.KSGF.SV.W.0235.000000T0000Z-260531T1815Z/", "test-pr2-svrsvs-new")
-	if _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{con}); err != nil {
+	if _, _, _, err := s.UpsertAlertsBatch(ctx, []nws.Alert{con}); err != nil {
 		t.Fatalf("upsert CON: %v", err)
 	}
 

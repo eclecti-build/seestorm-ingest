@@ -183,7 +183,7 @@ func (p *Poller) poll(pollCtx context.Context) {
 	cycleTimeout := deriveCycleTimeout(p.cfg.PollInterval)
 	fetchStoreBudget, publishBudget := splitCycleBudget(cycleTimeout)
 
-	var alertCount, reportCount int
+	var alertCount, reportCount, alertsSkippedUnparseable int
 
 	// Fetch+store phase (ingest + both modes): bounded so a slow NWS/SPC can't
 	// consume the whole cycle budget. When this context expires, in-flight
@@ -191,7 +191,7 @@ func (p *Poller) poll(pollCtx context.Context) {
 	// own fresh budget. Publish-only nodes skip this entirely.
 	if p.cfg.Mode.ShouldIngest() {
 		fetchStoreCtx, fetchStoreCancel := context.WithTimeout(pollCtx, fetchStoreBudget)
-		alertCount = p.pollAlerts(fetchStoreCtx)
+		alertCount, alertsSkippedUnparseable = p.pollAlerts(fetchStoreCtx)
 		reportCount = p.pollStormReports(fetchStoreCtx)
 		// PR2: drop expired dead rows so the table stops growing unboundedly.
 		// Runs only on ingest-role nodes (writers); idempotent across the fleet.
@@ -218,6 +218,7 @@ func (p *Poller) poll(pollCtx context.Context) {
 	slog.Info("poll cycle complete",
 		"mode", string(p.cfg.Mode),
 		"alerts_processed", alertCount,
+		"alerts_skipped_unparseable", alertsSkippedUnparseable,
 		"reports_processed", reportCount,
 		"duration", time.Since(start),
 		"cycle_timeout", cycleTimeout,
@@ -226,23 +227,28 @@ func (p *Poller) poll(pollCtx context.Context) {
 	)
 }
 
-func (p *Poller) pollAlerts(ctx context.Context) int {
+func (p *Poller) pollAlerts(ctx context.Context) (count int, skippedUnparseable int) {
 	// NWS supports a comma-separated `area` value natively, so multi-state
 	// polling is one request rather than N. See nws.FetchActiveAlerts docs.
 	alerts, err := p.cfg.NWS.FetchActiveAlerts(ctx, strings.Join(p.cfg.Areas, ","))
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to fetch alerts", "error", err)
-		return 0
+		return 0, 0
 	}
 
 	// Batch upsert — whole-cycle round-trip count drops from O(n) per-alert
 	// statements to one transactional batch, keeping us under
 	// PollCycleTimeoutSec under outbreak load. On tx failure the Store falls
 	// back to per-alert inserts and logs degraded_path=batch_upsert_fallback.
-	count, degraded, err := p.cfg.Store.UpsertAlertsBatch(ctx, alerts.Features)
+	// skipped counts alerts deliberately excluded for an unparseable
+	// `expires` timestamp (Store.parseAlertTimes) — not a failure, but
+	// aggregated into poll()'s cycle-summary log line below so a sustained
+	// rise is visible without an operator grepping individual per-row WARNs
+	// (REVIEW AMENDMENT, 2026-07-08 Tier 1 plan).
+	count, skipped, degraded, err := p.cfg.Store.UpsertAlertsBatch(ctx, alerts.Features)
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to batch-upsert alerts", "error", err)
-		return count
+		return count, skipped
 	}
 	if degraded {
 		slog.WarnContext(ctx, "alerts upserted via fallback path",
@@ -251,7 +257,7 @@ func (p *Poller) pollAlerts(ctx context.Context) int {
 		)
 	}
 
-	return count
+	return count, skipped
 }
 
 func (p *Poller) pollStormReports(ctx context.Context) int {
