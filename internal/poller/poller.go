@@ -2,7 +2,9 @@ package poller
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"time"
@@ -37,6 +39,26 @@ func New(cfg Config) *Poller {
 	return &Poller{cfg: cfg}
 }
 
+// pollSafely invokes fn (one poll cycle) recovering from any panic so a
+// single bad cycle can't unwind through Run and crash the process. This
+// is the sanctioned exception to the "no panic() in library code"
+// convention (seestorm-ingest/CLAUDE.md) — containment at one
+// well-defined boundary around each cycle, not control flow. The next
+// scheduled tick in Run's loop proceeds unaffected; nothing here retries
+// the panicking cycle early or otherwise changes scheduling.
+func pollSafely(ctx context.Context, fn func(context.Context)) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "poll cycle panicked",
+				"degraded_path", "cycle_panic_recovered",
+				"panic", fmt.Sprint(r),
+				"stack", string(debug.Stack()),
+			)
+		}
+	}()
+	fn(ctx)
+}
+
 // Run drives the polling loop with absolute-time scheduling. Unlike a naive
 // time.Ticker, which drifts when a poll cycle runs long and silently coalesces
 // missed ticks, this loop computes each wake-up as start + N*interval. When
@@ -44,8 +66,9 @@ func New(cfg Config) *Poller {
 // to the next future tick rather than firing back-to-back catch-up polls —
 // so load never amplifies during upstream slowness.
 func (p *Poller) Run(ctx context.Context) error {
-	// Run immediately on start.
-	p.poll(ctx)
+	// Run immediately on start. Wrapped so a panic in any phase doesn't
+	// crash the process before the loop even starts.
+	pollSafely(ctx, p.poll)
 
 	start := time.Now()
 	cycle := int64(1)
@@ -71,7 +94,7 @@ func (p *Poller) Run(ctx context.Context) error {
 			slog.InfoContext(ctx, "shutting down poller")
 			return nil
 		case <-timer.C:
-			p.poll(ctx)
+			pollSafely(ctx, p.poll)
 			cycle++
 		}
 	}
