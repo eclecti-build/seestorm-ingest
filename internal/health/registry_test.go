@@ -32,6 +32,34 @@ func TestRegistry_NilReceiverIsSafe(t *testing.T) {
 	}
 }
 
+func TestRegistry_PublishPutFailures_RecordAndReset(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+	r.RecordPublishPutFailure("WI")
+	r.RecordPublishPutFailure("WI")
+	r.RecordPublishPutFailure("IL")
+
+	got := r.PublishPutFailures()
+	if got["WI"] != 2 || got["IL"] != 1 {
+		t.Fatalf("PublishPutFailures = %+v, want WI:2 IL:1", got)
+	}
+
+	r.ResetPublishFailures()
+	if got := r.PublishPutFailures(); len(got) != 0 {
+		t.Fatalf("expected empty map after ResetPublishFailures, got %+v", got)
+	}
+}
+
+func TestRegistry_PublishPutFailures_NilReceiverIsSafe(t *testing.T) {
+	t.Parallel()
+	var r *Registry
+	r.RecordPublishPutFailure("WI") // must not panic
+	r.ResetPublishFailures()        // must not panic
+	if got := r.PublishPutFailures(); len(got) != 0 {
+		t.Fatalf("expected empty map from a nil registry, got %+v", got)
+	}
+}
+
 func TestRegistry_ConcurrentAccessIsRaceFree(t *testing.T) {
 	t.Parallel()
 	r := NewRegistry()

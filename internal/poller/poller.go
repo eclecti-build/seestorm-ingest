@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/eclecti-build/seestorm-ingest/internal/config"
@@ -446,11 +447,15 @@ func (p *Poller) pollStormReports(ctx context.Context) int {
 	return count
 }
 
-// publishTimeout is the per-call deadline for a single Publish or
-// PublishState invocation. Bounds the worst case so a single hung R2 PUT
-// can't block the rest of the cycle. Generous vs. typical R2 PUT latency
-// (sub-second) but well below the 30s polling interval.
-const publishTimeout = 5 * time.Second
+// publishPutTimeout is the per-attempt deadline for a single Publish or
+// PublishState call. See config.PerPublishPutTimeoutSec for the sizing
+// rationale.
+const publishPutTimeout = time.Duration(config.PerPublishPutTimeoutSec) * time.Second
+
+// publishRetryDelay is the fixed pause between a failed publish-put
+// attempt and its retry. See config.PublishPutMaxRetries's doc comment
+// for why this is fixed rather than jittered/exponential.
+const publishRetryDelay = time.Duration(config.PublishPutRetryDelayMs) * time.Millisecond
 
 func (p *Poller) publishSnapshot(ctx context.Context) {
 	alerts, err := p.cfg.Store.GetActiveAlerts(ctx)
@@ -460,52 +465,102 @@ func (p *Poller) publishSnapshot(ctx context.Context) {
 	}
 
 	// Build the merged snapshot first so the per-state siblings can reuse
-	// its GeneratedAt — NewSnapshot derives both generated_at and
-	// generated_at_ms from a single time.Now().UTC() call so the RFC3339 and
-	// epoch-ms fields can't drift sub-second. The client's staleness check
-	// depends on them agreeing, and merging clients that read both the
-	// merged file and a per-state sibling must see the same instant.
+	// its GeneratedAt — see publisher.NewSnapshot's doc comment for why
+	// the timestamps must agree across the whole fan-out.
 	snapshot := publisher.NewSnapshot(p.cfg.Areas, alerts)
+
+	// Reset per-state failure counters at the start of THIS cycle's
+	// publish phase so /healthz reflects only the current cycle's
+	// degradation, not a historical total.
+	p.cfg.Health.ResetPublishFailures()
 
 	// Merged snapshot — the back-compat path and the "view all" UX. Goes
 	// through the publisher's history archival as well.
-	p.publishWithTimeout(ctx, "merged", "", func(timeoutCtx context.Context) error {
+	if p.publishWithRetry(ctx, "merged", "", func(timeoutCtx context.Context) error {
 		return p.cfg.Publisher.Publish(timeoutCtx, snapshot)
-	})
-	// TEMPORARY (Tier 2 Task 4): recorded unconditionally — publishWithTimeout swallows its error, so FeedPublish stays green even if the merged publish failed. Task 6 replaces publishWithTimeout with publishWithRetry and gates this on actual success.
-	p.cfg.Health.RecordSuccess(health.FeedPublish, time.Now())
-
-	// Per-state snapshots — one per configured area, written to
-	// active-events/<STATE>.json. Cross-border alerts (states ⊃ {STATE})
-	// appear in every matching state's file, which is the natural
-	// semantics for an alert footprint that genuinely touches multiple
-	// states. Alerts with no resolved States[] don't appear in any
-	// per-state file (they remain in the merged snapshot only) — this
-	// degrades gracefully for upstream payloads we can't classify.
-	for _, state := range p.cfg.Areas {
-		filtered := filterAlertsByState(alerts, state)
-		stateSnapshot := publisher.NewStateSnapshot(state, filtered, snapshot.GeneratedAt)
-		p.publishWithTimeout(ctx, "state", state, func(timeoutCtx context.Context) error {
-			return p.cfg.Publisher.PublishState(timeoutCtx, stateSnapshot)
-		})
+	}) {
+		p.cfg.Health.RecordSuccess(health.FeedPublish, time.Now())
 	}
+
+	p.publishPerStateSnapshots(ctx, alerts, snapshot.GeneratedAt)
 }
 
-// publishWithTimeout wraps a single publish call in a bounded deadline so
-// one hung destination (typically an R2 PUT during a Cloudflare degradation)
-// can't starve the rest of the publish fan-out. Logs failures with kind +
-// state context for triage; never returns an error because publish failures
-// are non-fatal for the polling loop (next cycle in 30s will overwrite).
-func (p *Poller) publishWithTimeout(parent context.Context, kind, state string, fn func(context.Context) error) {
-	ctx, cancel := context.WithTimeout(parent, publishTimeout)
-	defer cancel()
-	if err := fn(ctx); err != nil {
-		attrs := []any{"kind", kind, "error", err}
-		if state != "" {
-			attrs = append(attrs, "state", state)
-		}
-		slog.ErrorContext(parent, "publish failed", attrs...)
+// publishPerStateSnapshots fans the per-state R2 writes out with bounded
+// concurrency (config.PublishConcurrency) instead of a sequential loop.
+// Sequential iteration under one shared 15s budget meant one slow/hung
+// state starved every state after it in iteration order — bounded
+// concurrency means a hung state only ever occupies one of the
+// concurrency slots, not the entire remaining budget.
+func (p *Poller) publishPerStateSnapshots(ctx context.Context, alerts []store.ActiveAlertGeoJSON, generatedAt time.Time) {
+	sem := make(chan struct{}, config.PublishConcurrency)
+	var wg sync.WaitGroup
+	for _, state := range p.cfg.Areas {
+		state := state
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			filtered := filterAlertsByState(alerts, state)
+			stateSnapshot := publisher.NewStateSnapshot(state, filtered, generatedAt)
+			ok := p.publishWithRetry(ctx, "state", state, func(timeoutCtx context.Context) error {
+				return p.cfg.Publisher.PublishState(timeoutCtx, stateSnapshot)
+			})
+			if !ok {
+				p.cfg.Health.RecordPublishPutFailure(state)
+			}
+		}()
 	}
+	wg.Wait()
+}
+
+// publishWithRetry wraps a single publish call with a bounded per-attempt
+// timeout and one retry, returning whether it ultimately succeeded. Logs
+// failures with kind + state context for triage; never returns an error
+// because a publish failure is non-fatal for the polling loop overall
+// (next cycle in 30s retries from scratch) — the caller uses the bool to
+// record the failure (see RecordPublishPutFailure) rather than treating
+// it as cycle-fatal.
+func (p *Poller) publishWithRetry(parent context.Context, kind, state string, fn func(context.Context) error) bool {
+	lastErr := attemptPublish(parent, fn, config.PublishPutMaxRetries+1, publishPutTimeout, publishRetryDelay)
+	if lastErr == nil {
+		return true
+	}
+	attrs := []any{"kind", kind, "error", lastErr}
+	if state != "" {
+		attrs = append(attrs, "state", state)
+	}
+	slog.ErrorContext(parent, "publish failed after retry", attrs...)
+	return false
+}
+
+// attemptPublish runs fn up to maxAttempts times, each under its own
+// perAttemptTimeout child context derived from parent, pausing
+// retryDelay between attempts (or stopping early if parent is already
+// done). Returns nil on the first success, or the last error otherwise.
+// Pure enough to unit test directly with a fake fn and a pre-canceled
+// parent ctx (see publish_retry_test.go).
+func attemptPublish(parent context.Context, fn func(context.Context) error, maxAttempts int, perAttemptTimeout, retryDelay time.Duration) error {
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(parent, perAttemptTimeout)
+		err := fn(ctx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt == maxAttempts-1 {
+			return lastErr
+		}
+		select {
+		case <-parent.Done():
+			return parent.Err()
+		case <-time.After(retryDelay):
+		}
+	}
+	return lastErr
 }
 
 // filterAlertsByState returns the subset of alerts whose States slice

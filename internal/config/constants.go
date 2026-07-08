@@ -28,6 +28,36 @@ const (
 	// observed cycles finish inside comfortably.
 	PublishPhaseBudgetSec = 15
 
+	// PerPublishPutTimeoutSec is the per-attempt deadline for a single
+	// Publish or PublishState R2 call. Reduced from the original flat 5s
+	// (2026-04-21 incident fix) to 3s so more per-state puts fit inside
+	// the shared 15s PublishPhaseBudgetSec as the NWS_AREA roster grows
+	// toward a ~55-state ceiling (a possible future Tier-0 widening) —
+	// still generous versus typical sub-second R2 PUT latency.
+	PerPublishPutTimeoutSec = 3
+
+	// PublishPutMaxRetries is the number of retries (in addition to the
+	// initial attempt) for a single per-put publish call. Fixed short
+	// delay between attempts (see PublishPutRetryDelayMs) rather than
+	// exponential/jittered backoff — R2 puts are writes to our own
+	// private bucket, not a shared rate-limited public API, so the
+	// thundering-herd rationale behind internal/retry's jitter doesn't
+	// apply here.
+	PublishPutMaxRetries = 1
+
+	// PublishPutRetryDelayMs is the fixed pause between a failed publish
+	// put attempt and its retry.
+	PublishPutRetryDelayMs = 200
+
+	// PublishConcurrency bounds how many per-state R2 puts run at once
+	// during the per-state fan-out. Bounded (not unbounded) to avoid
+	// hammering R2 with a burst of ~55 simultaneous PUTs once the state
+	// roster grows past the current 9; not serialized (the pre-Tier-2
+	// behavior) because sequential puts under a shared 15s budget meant
+	// one slow state could starve every state after it in iteration
+	// order — exactly the bug this constant's usage fixes.
+	PublishConcurrency = 4
+
 	NWSResponseMaxBytes = 32 * 1024 * 1024 // io.LimitReader cap
 	SPCResponseMaxBytes = 4 * 1024 * 1024  // io.LimitReader cap
 
