@@ -367,6 +367,10 @@ func (p *Poller) pollAlerts(ctx context.Context) (count int, skippedUnparseable 
 	if unchanged, realErr := classifyAlertFetchErr(err); unchanged {
 		// 304 Not Modified: upstream confirmed nothing changed. Still a
 		// successful fetch for health purposes — skip decode + upsert.
+		// Observable effect: this cycle's "poll cycle complete" log reads
+		// alerts_processed=0, indistinguishable from zero active alerts.
+		// On-call should treat repeated 0s with no fetch errors as healthy
+		// steady-state, not stopped ingestion.
 		p.cfg.Health.RecordSuccess(health.FeedAlerts, time.Now())
 		return 0, 0
 	} else if realErr != nil {
@@ -490,7 +494,8 @@ func (p *Poller) publishSnapshot(ctx context.Context) {
 // Sequential iteration under one shared 15s budget meant one slow/hung
 // state starved every state after it in iteration order — bounded
 // concurrency means a hung state only ever occupies one of the
-// concurrency slots, not the entire remaining budget.
+// concurrency slots, not the entire remaining budget. Goroutine panics are
+// contained here because pollSafely cannot see other goroutines' stacks.
 func (p *Poller) publishPerStateSnapshots(ctx context.Context, alerts []store.ActiveAlertGeoJSON, generatedAt time.Time) {
 	sem := make(chan struct{}, config.PublishConcurrency)
 	var wg sync.WaitGroup
@@ -501,6 +506,17 @@ func (p *Poller) publishPerStateSnapshots(ctx context.Context, alerts []store.Ac
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					slog.ErrorContext(ctx, "per-state publish panicked",
+						"degraded_path", "publish_put_panic_recovered",
+						"state", state,
+						"panic", fmt.Sprint(r),
+						"stack", string(debug.Stack()),
+					)
+					p.cfg.Health.RecordPublishPutFailure(state)
+				}
+			}()
 
 			filtered := filterAlertsByState(alerts, state)
 			stateSnapshot := publisher.NewStateSnapshot(state, filtered, generatedAt)

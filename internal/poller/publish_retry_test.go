@@ -91,6 +91,7 @@ type fakePublisher struct {
 	statePutCalls map[string]int
 	blockState    string
 	blockUntil    <-chan struct{}
+	panicState    string
 }
 
 func (f *fakePublisher) Publish(_ context.Context, _ publisher.Snapshot) error {
@@ -101,6 +102,10 @@ func (f *fakePublisher) PublishState(ctx context.Context, snap publisher.StateSn
 	f.mu.Lock()
 	f.statePutCalls[snap.AreaState]++
 	f.mu.Unlock()
+
+	if snap.AreaState == f.panicState {
+		panic("publish state panic")
+	}
 
 	if snap.AreaState == f.blockState {
 		select {
@@ -116,6 +121,30 @@ func (f *fakePublisher) callCount(state string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.statePutCalls[state]
+}
+
+func TestPublishPerStateSnapshots_RecoversStatePublisherPanic(t *testing.T) {
+	t.Parallel()
+	areas := []string{"WI", "IL", "MI", "OH", "IN"}
+	fp := &fakePublisher{
+		statePutCalls: make(map[string]int),
+		panicState:    "WI",
+	}
+
+	reg := healthRegistryForTest()
+	p := &Poller{cfg: Config{Areas: areas, Publisher: fp, Health: reg}}
+
+	p.publishPerStateSnapshots(context.Background(), nil, time.Now())
+
+	for _, state := range []string{"IL", "MI", "OH", "IN"} {
+		if fp.callCount(state) != 1 {
+			t.Errorf("state %s: expected exactly 1 PublishState call despite WI panic, got %d", state, fp.callCount(state))
+		}
+	}
+	failures := reg.PublishPutFailures()
+	if failures["WI"] != 1 {
+		t.Fatalf("expected WI panic to be recorded as one publish-put failure, got failures=%+v", failures)
+	}
 }
 
 func TestPublishPerStateSnapshots_BoundedConcurrency(t *testing.T) {

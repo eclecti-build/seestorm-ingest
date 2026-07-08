@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"time"
+
+	"github.com/eclecti-build/seestorm-ingest/internal/config"
 )
 
 type staleFeed struct {
@@ -48,16 +50,7 @@ func NewHandler(reg *Registry, feeds []Feed, maxAge time.Duration, now func() ti
 }
 
 // StalenessMultiplier is how many PollIntervals a required feed may go
-// without a recorded success before /healthz reports it stale. Re-exported
-// from config so callers don't need a separate import just for this one
-// number.
-const StalenessMultiplier = healthStalenessMultiplier
-
-// healthStalenessMultiplier mirrors config.HealthStalenessMultiplier.
-// Duplicated as a plain const (rather than importing internal/config)
-// because internal/config has no reason to depend on internal/health or
-// vice versa, and this package should stay leaf-level; main.go computes
-// the actual maxAge duration from config.HealthStalenessMultiplier *
-// pollInterval directly and passes it to NewHandler, so this constant
-// here is documentation/tests-only convenience, not load-bearing.
-const healthStalenessMultiplier = 3
+// without a recorded success before /healthz reports it stale. It re-exports
+// config's value so callers need no separate config import and there is
+// exactly one source of truth.
+const StalenessMultiplier = config.HealthStalenessMultiplier
