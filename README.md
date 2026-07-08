@@ -24,6 +24,7 @@ go run ./cmd/ingest
 | `SNAPSHOT_DIR` | `./snapshots` | Directory for JSON snapshot output |
 | `POLL_INTERVAL` | `30s` | Polling interval (Go duration format) |
 | `NWS_AREA` | `WI` | USPS state code(s) to poll. Accepts a single value (`WI`) or comma-separated list (`MN,WI,IL,IN,MI,OH,PA,NY,IA`). One HTTP request regardless of list length. |
+| `MODE` | `both` (fatal at boot if unset AND `FLY_APP_NAME` is set) | Fleet role: `both` (local dev/single-node), `ingest` (region node, no publish), or `publish` (single snapshot publisher, no polling). Required explicitly on Fly — see CLAUDE.md "Fleet & deployment". |
 
 ## Architecture
 
