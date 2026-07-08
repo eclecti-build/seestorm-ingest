@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"regexp"
@@ -11,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/eclecti-build/seestorm-ingest/internal/config"
+	"github.com/eclecti-build/seestorm-ingest/internal/health"
 	"github.com/eclecti-build/seestorm-ingest/internal/nws"
 	"github.com/eclecti-build/seestorm-ingest/internal/poller"
 	"github.com/eclecti-build/seestorm-ingest/internal/publisher"
@@ -123,6 +127,7 @@ func run() error {
 	nwsClient := nws.NewClient(nwsUserAgent)
 	spcClient := spc.NewClient()
 	pub := publisher.NewMulti(publishers...)
+	healthReg := health.NewRegistry()
 
 	p := poller.New(poller.Config{
 		NWS:          nwsClient,
@@ -132,7 +137,28 @@ func run() error {
 		PollInterval: pollInterval,
 		Areas:        areas,
 		Mode:         mode,
+		Health:       healthReg,
 	})
+
+	maxAge := time.Duration(health.StalenessMultiplier) * pollInterval
+	feeds := health.RequiredFeeds(mode.ShouldIngest(), mode.ShouldPublish())
+	mux := http.NewServeMux()
+	mux.Handle("/healthz", health.NewHandler(healthReg, feeds, maxAge, time.Now))
+	healthSrv := &http.Server{
+		Addr:              fmt.Sprintf(":%d", config.HealthPort),
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		if err := healthSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("health server failed", "error", err)
+		}
+	}()
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		_ = healthSrv.Shutdown(shutdownCtx)
+	}()
 
 	slog.Info("starting seestorm-ingest",
 		"mode", string(mode),

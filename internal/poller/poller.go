@@ -2,12 +2,18 @@ package poller
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"math/rand/v2"
+	"runtime/debug"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/eclecti-build/seestorm-ingest/internal/config"
+	"github.com/eclecti-build/seestorm-ingest/internal/health"
 	"github.com/eclecti-build/seestorm-ingest/internal/nws"
 	"github.com/eclecti-build/seestorm-ingest/internal/publisher"
 	"github.com/eclecti-build/seestorm-ingest/internal/spc"
@@ -27,6 +33,15 @@ type Config struct {
 	// Mode selects which phases of the cycle this node runs (ingest, publish,
 	// or both). The zero value behaves as ModeBoth. See Mode.
 	Mode Mode
+	// Health records per-feed last-success timestamps for /healthz. Safe
+	// to leave nil (health.Registry's methods are nil-receiver-safe) —
+	// existing/future unit tests that build a bare Config don't need it.
+	Health *health.Registry
+	// jitterFunc overrides startup-jitter delay computation for tests.
+	// nil in production, which uses startupJitter's real math/rand/v2
+	// implementation. Unexported: only this package's own tests can set
+	// it — not part of the public Config surface cmd/ingest/main.go uses.
+	jitterFunc func(time.Duration) time.Duration
 }
 
 type Poller struct {
@@ -37,6 +52,26 @@ func New(cfg Config) *Poller {
 	return &Poller{cfg: cfg}
 }
 
+// pollSafely invokes fn (one poll cycle) recovering from any panic so a
+// single bad cycle can't unwind through Run and crash the process. This
+// is the sanctioned exception to the "no panic() in library code"
+// convention (seestorm-ingest/CLAUDE.md) — containment at one
+// well-defined boundary around each cycle, not control flow. The next
+// scheduled tick in Run's loop proceeds unaffected; nothing here retries
+// the panicking cycle early or otherwise changes scheduling.
+func pollSafely(ctx context.Context, fn func(context.Context)) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "poll cycle panicked",
+				"degraded_path", "cycle_panic_recovered",
+				"panic", fmt.Sprint(r),
+				"stack", string(debug.Stack()),
+			)
+		}
+	}()
+	fn(ctx)
+}
+
 // Run drives the polling loop with absolute-time scheduling. Unlike a naive
 // time.Ticker, which drifts when a poll cycle runs long and silently coalesces
 // missed ticks, this loop computes each wake-up as start + N*interval. When
@@ -44,8 +79,32 @@ func New(cfg Config) *Poller {
 // to the next future tick rather than firing back-to-back catch-up polls —
 // so load never amplifies during upstream slowness.
 func (p *Poller) Run(ctx context.Context) error {
-	// Run immediately on start.
-	p.poll(ctx)
+	// One-time random phase offset in [0, PollInterval) before the FIRST
+	// cycle only — NOT a per-cycle change. Without it, a fleet-wide
+	// redeploy leaves every node's absolute-time schedule (see this
+	// function's top-level doc comment) anchored to the same instant
+	// forever, so the 7 ingest-role apps hit NWS/SPC in lockstep every
+	// cycle indefinitely. The publisher is exempt (Poller.startupJitter
+	// returns 0 when Mode.ShouldIngest() is false, review amendment) — it
+	// never polls upstreams, so this rationale doesn't apply to it and
+	// jitter there would only add pure post-deploy staleness. The
+	// schedule that follows is still pure start + N*interval absolute-time
+	// scheduling — this only moves where `start` falls relative to the
+	// fleet-wide redeploy instant.
+	if jitter := p.startupJitter(); jitter > 0 {
+		slog.InfoContext(ctx, "poller startup jitter", "delay", jitter)
+		timer := time.NewTimer(jitter)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			slog.InfoContext(ctx, "shutting down poller during startup jitter")
+			return nil
+		case <-timer.C:
+		}
+	}
+
+	// Run immediately (post-jitter) on start.
+	pollSafely(ctx, p.poll)
 
 	start := time.Now()
 	cycle := int64(1)
@@ -71,7 +130,7 @@ func (p *Poller) Run(ctx context.Context) error {
 			slog.InfoContext(ctx, "shutting down poller")
 			return nil
 		case <-timer.C:
-			p.poll(ctx)
+			pollSafely(ctx, p.poll)
 			cycle++
 		}
 	}
@@ -109,6 +168,38 @@ func deriveCycleTimeout(interval time.Duration) time.Duration {
 	return derived
 }
 
+// startupJitter returns a random duration in [0, interval) used once as
+// an initial delay before the FIRST poll cycle, so a fleet-wide redeploy
+// (all 8 apps restarting within the same second) doesn't leave every
+// node's absolute-time schedule anchored to the same instant forever —
+// this loop never re-jitters after the first cycle, so without this a
+// lockstep fleet stays locked in step indefinitely, all 8 hitting
+// NWS/SPC at the same moment every cycle. math/rand/v2 is auto-seeded,
+// so this is intentionally non-deterministic across process restarts;
+// Config.jitterFunc overrides it for deterministic tests.
+func startupJitter(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(interval)))
+}
+
+func (p *Poller) startupJitter() time.Duration {
+	// Publish-only nodes never poll NWS/SPC (Mode.ShouldIngest() is
+	// false) — the lockstep-avoidance rationale above (de-sync the 8
+	// fleet nodes' upstream polling after a fleet-wide redeploy) doesn't
+	// apply to them. Applying jitter anyway would only add up to
+	// PollInterval of pure post-deploy staleness on the merged/history R2
+	// snapshot for zero benefit (review amendment).
+	if !p.cfg.Mode.ShouldIngest() {
+		return 0
+	}
+	if p.cfg.jitterFunc != nil {
+		return p.cfg.jitterFunc(p.cfg.PollInterval)
+	}
+	return startupJitter(p.cfg.PollInterval)
+}
+
 // splitCycleBudget divides the per-cycle wall-clock budget into a fetch+store
 // phase budget and a separate publish-phase budget. The publish phase aims
 // for PublishPhaseBudgetSec (15s) regardless of how long fetch+store took,
@@ -142,6 +233,28 @@ func splitCycleBudget(cycleTimeout time.Duration) (fetchStoreBudget, publishBudg
 		fetchStoreBudget = phaseFloor
 	}
 	return fetchStoreBudget, publishBudget
+}
+
+// withBudgetFraction derives a child context capped at pct percent of
+// ctx's CURRENTLY REMAINING time until its deadline — not a fixed
+// fraction of the whole phase, since "remaining" shrinks as earlier
+// fetches in the same phase consume time. If ctx has no deadline (not
+// expected in production — poll always derives fetchStoreCtx with
+// context.WithTimeout — but kept safe for tests/callers that pass a bare
+// context.Background()), returns a cancelable copy of ctx unchanged so
+// callers still get a valid CancelFunc to defer. See this task's "retry
+// budget fairness" design decision.
+func withBudgetFraction(ctx context.Context, pct int) (context.Context, context.CancelFunc) {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return context.WithCancel(ctx)
+	}
+	remaining := time.Until(dl)
+	if remaining <= 0 {
+		return context.WithDeadline(ctx, dl)
+	}
+	capped := time.Duration(int64(remaining) * int64(pct) / 100)
+	return context.WithTimeout(ctx, capped)
 }
 
 // poll runs one polling cycle. The cycle runs under a derived cycleTimeout
@@ -227,14 +340,44 @@ func (p *Poller) poll(pollCtx context.Context) {
 	)
 }
 
+// classifyAlertFetchErr distinguishes "unchanged" (304 via
+// nws.ErrNotModified) from a real failure. Pure function so it — and
+// therefore the branching behavior pollAlerts relies on — is unit
+// testable without a live *nws.Client (NWS is a concrete field on
+// Config, not an interface; see this plan's "Corrections" section).
+func classifyAlertFetchErr(err error) (unchanged bool, realErr error) {
+	if errors.Is(err, nws.ErrNotModified) {
+		return true, nil
+	}
+	return false, err
+}
+
 func (p *Poller) pollAlerts(ctx context.Context) (count int, skippedUnparseable int) {
-	// NWS supports a comma-separated `area` value natively, so multi-state
-	// polling is one request rather than N. See nws.FetchActiveAlerts docs.
-	alerts, err := p.cfg.NWS.FetchActiveAlerts(ctx, strings.Join(p.cfg.Areas, ","))
-	if err != nil {
-		slog.ErrorContext(ctx, "failed to fetch alerts", "error", err)
+	// Cap the alerts fetch (including any internal/retry retries) at
+	// AlertsFetchBudgetPercent of whatever fetch+store budget remains
+	// right now. Alerts fetches first among this phase's upstream calls
+	// — without this cap, a slow/retrying NWS could consume the ENTIRE
+	// fetch+store budget and starve the three SPC CSV fetches and the
+	// store-upsert step below (review amendment; see withBudgetFraction).
+	// The store-upsert call keeps using ctx directly, NOT this
+	// sub-context, so it always gets whatever's left of the real budget.
+	fetchCtx, fetchCancel := withBudgetFraction(ctx, config.AlertsFetchBudgetPercent)
+	alerts, err := p.cfg.NWS.FetchActiveAlerts(fetchCtx, strings.Join(p.cfg.Areas, ","))
+	fetchCancel()
+	if unchanged, realErr := classifyAlertFetchErr(err); unchanged {
+		// 304 Not Modified: upstream confirmed nothing changed. Still a
+		// successful fetch for health purposes — skip decode + upsert.
+		// Observable effect: this cycle's "poll cycle complete" log reads
+		// alerts_processed=0, indistinguishable from zero active alerts.
+		// On-call should treat repeated 0s with no fetch errors as healthy
+		// steady-state, not stopped ingestion.
+		p.cfg.Health.RecordSuccess(health.FeedAlerts, time.Now())
+		return 0, 0
+	} else if realErr != nil {
+		slog.ErrorContext(ctx, "failed to fetch alerts", "error", realErr)
 		return 0, 0
 	}
+	p.cfg.Health.RecordSuccess(health.FeedAlerts, time.Now())
 
 	// Batch upsert — whole-cycle round-trip count drops from O(n) per-alert
 	// statements to one transactional batch, keeping us under
@@ -261,25 +404,34 @@ func (p *Poller) pollAlerts(ctx context.Context) (count int, skippedUnparseable 
 }
 
 func (p *Poller) pollStormReports(ctx context.Context) int {
-	reports, err := p.cfg.SPC.FetchTodayTornadoReports(ctx)
+	tornCtx, tornCancel := withBudgetFraction(ctx, config.SPCFetchBudgetPercent)
+	reports, err := p.cfg.SPC.FetchTodayTornadoReports(tornCtx)
+	tornCancel()
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to fetch tornado reports", "error", err)
 		// A tornado-feed failure shouldn't kill hail + wind ingest — keep going.
 		reports = nil
+	} else {
+		p.cfg.Health.RecordSuccess(health.FeedSPCTorn, time.Now())
 	}
 
-	// Also fetch hail and wind
-	hailReports, err := p.cfg.SPC.FetchTodayHailReports(ctx)
+	hailCtx, hailCancel := withBudgetFraction(ctx, config.SPCFetchBudgetPercent)
+	hailReports, err := p.cfg.SPC.FetchTodayHailReports(hailCtx)
+	hailCancel()
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to fetch hail reports", "error", err)
 	} else {
+		p.cfg.Health.RecordSuccess(health.FeedSPCHail, time.Now())
 		reports = append(reports, hailReports...)
 	}
 
-	windReports, err := p.cfg.SPC.FetchTodayWindReports(ctx)
+	windCtx, windCancel := withBudgetFraction(ctx, config.SPCFetchBudgetPercent)
+	windReports, err := p.cfg.SPC.FetchTodayWindReports(windCtx)
+	windCancel()
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to fetch wind reports", "error", err)
 	} else {
+		p.cfg.Health.RecordSuccess(health.FeedSPCWind, time.Now())
 		reports = append(reports, windReports...)
 	}
 
@@ -299,11 +451,15 @@ func (p *Poller) pollStormReports(ctx context.Context) int {
 	return count
 }
 
-// publishTimeout is the per-call deadline for a single Publish or
-// PublishState invocation. Bounds the worst case so a single hung R2 PUT
-// can't block the rest of the cycle. Generous vs. typical R2 PUT latency
-// (sub-second) but well below the 30s polling interval.
-const publishTimeout = 5 * time.Second
+// publishPutTimeout is the per-attempt deadline for a single Publish or
+// PublishState call. See config.PerPublishPutTimeoutSec for the sizing
+// rationale.
+const publishPutTimeout = time.Duration(config.PerPublishPutTimeoutSec) * time.Second
+
+// publishRetryDelay is the fixed pause between a failed publish-put
+// attempt and its retry. See config.PublishPutMaxRetries's doc comment
+// for why this is fixed rather than jittered/exponential.
+const publishRetryDelay = time.Duration(config.PublishPutRetryDelayMs) * time.Millisecond
 
 func (p *Poller) publishSnapshot(ctx context.Context) {
 	alerts, err := p.cfg.Store.GetActiveAlerts(ctx)
@@ -313,50 +469,114 @@ func (p *Poller) publishSnapshot(ctx context.Context) {
 	}
 
 	// Build the merged snapshot first so the per-state siblings can reuse
-	// its GeneratedAt — NewSnapshot derives both generated_at and
-	// generated_at_ms from a single time.Now().UTC() call so the RFC3339 and
-	// epoch-ms fields can't drift sub-second. The client's staleness check
-	// depends on them agreeing, and merging clients that read both the
-	// merged file and a per-state sibling must see the same instant.
+	// its GeneratedAt — see publisher.NewSnapshot's doc comment for why
+	// the timestamps must agree across the whole fan-out.
 	snapshot := publisher.NewSnapshot(p.cfg.Areas, alerts)
+
+	// Reset per-state failure counters at the start of THIS cycle's
+	// publish phase so /healthz reflects only the current cycle's
+	// degradation, not a historical total.
+	p.cfg.Health.ResetPublishFailures()
 
 	// Merged snapshot — the back-compat path and the "view all" UX. Goes
 	// through the publisher's history archival as well.
-	p.publishWithTimeout(ctx, "merged", "", func(timeoutCtx context.Context) error {
+	if p.publishWithRetry(ctx, "merged", "", func(timeoutCtx context.Context) error {
 		return p.cfg.Publisher.Publish(timeoutCtx, snapshot)
-	})
-
-	// Per-state snapshots — one per configured area, written to
-	// active-events/<STATE>.json. Cross-border alerts (states ⊃ {STATE})
-	// appear in every matching state's file, which is the natural
-	// semantics for an alert footprint that genuinely touches multiple
-	// states. Alerts with no resolved States[] don't appear in any
-	// per-state file (they remain in the merged snapshot only) — this
-	// degrades gracefully for upstream payloads we can't classify.
-	for _, state := range p.cfg.Areas {
-		filtered := filterAlertsByState(alerts, state)
-		stateSnapshot := publisher.NewStateSnapshot(state, filtered, snapshot.GeneratedAt)
-		p.publishWithTimeout(ctx, "state", state, func(timeoutCtx context.Context) error {
-			return p.cfg.Publisher.PublishState(timeoutCtx, stateSnapshot)
-		})
+	}) {
+		p.cfg.Health.RecordSuccess(health.FeedPublish, time.Now())
 	}
+
+	p.publishPerStateSnapshots(ctx, alerts, snapshot.GeneratedAt)
 }
 
-// publishWithTimeout wraps a single publish call in a bounded deadline so
-// one hung destination (typically an R2 PUT during a Cloudflare degradation)
-// can't starve the rest of the publish fan-out. Logs failures with kind +
-// state context for triage; never returns an error because publish failures
-// are non-fatal for the polling loop (next cycle in 30s will overwrite).
-func (p *Poller) publishWithTimeout(parent context.Context, kind, state string, fn func(context.Context) error) {
-	ctx, cancel := context.WithTimeout(parent, publishTimeout)
-	defer cancel()
-	if err := fn(ctx); err != nil {
-		attrs := []any{"kind", kind, "error", err}
-		if state != "" {
-			attrs = append(attrs, "state", state)
-		}
-		slog.ErrorContext(parent, "publish failed", attrs...)
+// publishPerStateSnapshots fans the per-state R2 writes out with bounded
+// concurrency (config.PublishConcurrency) instead of a sequential loop.
+// Sequential iteration under one shared 15s budget meant one slow/hung
+// state starved every state after it in iteration order — bounded
+// concurrency means a hung state only ever occupies one of the
+// concurrency slots, not the entire remaining budget. Goroutine panics are
+// contained here because pollSafely cannot see other goroutines' stacks.
+func (p *Poller) publishPerStateSnapshots(ctx context.Context, alerts []store.ActiveAlertGeoJSON, generatedAt time.Time) {
+	sem := make(chan struct{}, config.PublishConcurrency)
+	var wg sync.WaitGroup
+	for _, state := range p.cfg.Areas {
+		state := state
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					slog.ErrorContext(ctx, "per-state publish panicked",
+						"degraded_path", "publish_put_panic_recovered",
+						"state", state,
+						"panic", fmt.Sprint(r),
+						"stack", string(debug.Stack()),
+					)
+					p.cfg.Health.RecordPublishPutFailure(state)
+				}
+			}()
+
+			filtered := filterAlertsByState(alerts, state)
+			stateSnapshot := publisher.NewStateSnapshot(state, filtered, generatedAt)
+			ok := p.publishWithRetry(ctx, "state", state, func(timeoutCtx context.Context) error {
+				return p.cfg.Publisher.PublishState(timeoutCtx, stateSnapshot)
+			})
+			if !ok {
+				p.cfg.Health.RecordPublishPutFailure(state)
+			}
+		}()
 	}
+	wg.Wait()
+}
+
+// publishWithRetry wraps a single publish call with a bounded per-attempt
+// timeout and one retry, returning whether it ultimately succeeded. Logs
+// failures with kind + state context for triage; never returns an error
+// because a publish failure is non-fatal for the polling loop overall
+// (next cycle in 30s retries from scratch) — the caller uses the bool to
+// record the failure (see RecordPublishPutFailure) rather than treating
+// it as cycle-fatal.
+func (p *Poller) publishWithRetry(parent context.Context, kind, state string, fn func(context.Context) error) bool {
+	lastErr := attemptPublish(parent, fn, config.PublishPutMaxRetries+1, publishPutTimeout, publishRetryDelay)
+	if lastErr == nil {
+		return true
+	}
+	attrs := []any{"kind", kind, "error", lastErr}
+	if state != "" {
+		attrs = append(attrs, "state", state)
+	}
+	slog.ErrorContext(parent, "publish failed after retry", attrs...)
+	return false
+}
+
+// attemptPublish runs fn up to maxAttempts times, each under its own
+// perAttemptTimeout child context derived from parent, pausing
+// retryDelay between attempts (or stopping early if parent is already
+// done). Returns nil on the first success, or the last error otherwise.
+// Pure enough to unit test directly with a fake fn and a pre-canceled
+// parent ctx (see publish_retry_test.go).
+func attemptPublish(parent context.Context, fn func(context.Context) error, maxAttempts int, perAttemptTimeout, retryDelay time.Duration) error {
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(parent, perAttemptTimeout)
+		err := fn(ctx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt == maxAttempts-1 {
+			return lastErr
+		}
+		select {
+		case <-parent.Done():
+			return parent.Err()
+		case <-time.After(retryDelay):
+		}
+	}
+	return lastErr
 }
 
 // filterAlertsByState returns the subset of alerts whose States slice
