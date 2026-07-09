@@ -50,3 +50,26 @@ func TestClassifyAlertFetchErr_Nil(t *testing.T) {
 		t.Fatalf("expected real=nil, got %v", realErr)
 	}
 }
+
+func TestETagVouchesForStore(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name             string
+		lastUpsertFailed bool
+		want             bool
+	}{
+		{"previous 200 payload landed", false, true},
+		{"previous 200 payload failed to land", true, false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := etagVouchesForStore(tc.lastUpsertFailed); got != tc.want {
+				t.Fatalf("etagVouchesForStore(%v) = %v, want %v", tc.lastUpsertFailed, got, tc.want)
+			}
+		})
+	}
+}

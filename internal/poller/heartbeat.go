@@ -17,9 +17,11 @@ package poller
 // given this node's Mode and the two independently-tracked outcomes:
 //
 //   - alertsOK: the NWS alerts fetch AND its DB upsert both succeeded this
-//     cycle. SPC (storm-report) fetch failures do NOT factor in — they
-//     already fail independently and non-fatally in pollStormReports, and
-//     alerts are this project's actual safety-critical feed.
+//     cycle, OR NWS returned 304 Not Modified after the most recent 200-path
+//     alerts payload had actually landed in the store. SPC (storm-report)
+//     fetch failures do NOT factor in — they already fail independently and
+//     non-fatally in pollStormReports, and alerts are this project's actual
+//     safety-critical feed.
 //   - mergedPublishOK: the merged-snapshot Publish call succeeded this
 //     cycle. Per-state PublishState failures do NOT factor in — the
 //     merged file is the back-compat/"view all" fallback every client can

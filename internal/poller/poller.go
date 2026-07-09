@@ -52,6 +52,10 @@ type Config struct {
 
 type Poller struct {
 	cfg Config
+	// lastAlertsUpsertFailed tracks whether the most recent 200-path
+	// alerts upsert failed after NWS had already advanced its cached ETag.
+	// poll() runs single-threaded, so this cross-cycle state needs no lock.
+	lastAlertsUpsertFailed bool
 }
 
 func New(cfg Config) *Poller {
@@ -375,6 +379,10 @@ func classifyAlertFetchErr(err error) (unchanged bool, realErr error) {
 	return false, err
 }
 
+func etagVouchesForStore(lastUpsertFailed bool) bool {
+	return !lastUpsertFailed
+}
+
 func (p *Poller) pollAlerts(ctx context.Context) (count, skippedUnparseable int, ok bool) {
 	// Cap the alerts fetch (including any internal/retry retries) at
 	// AlertsFetchBudgetPercent of whatever fetch+store budget remains
@@ -389,13 +397,13 @@ func (p *Poller) pollAlerts(ctx context.Context) (count, skippedUnparseable int,
 	fetchCancel()
 	if unchanged, realErr := classifyAlertFetchErr(err); unchanged {
 		// 304 Not Modified: upstream confirmed nothing changed. Still a
-		// successful fetch for health purposes — skip decode + upsert.
-		// Observable effect: this cycle's "poll cycle complete" log reads
-		// alerts_processed=0, indistinguishable from zero active alerts.
-		// On-call should treat repeated 0s with no fetch errors as healthy
-		// steady-state, not stopped ingestion.
+		// successful fetch for /healthz purposes — skip decode + upsert.
+		// For the dead-man's-switch heartbeat, the ETag only vouches for
+		// data already landed in the store; if the last 200-path upsert
+		// failed, keep withholding the heartbeat until a future 200 payload
+		// upserts successfully.
 		p.cfg.Health.RecordSuccess(health.FeedAlerts, time.Now())
-		return 0, 0, true
+		return 0, 0, etagVouchesForStore(p.lastAlertsUpsertFailed)
 	} else if realErr != nil {
 		slog.ErrorContext(ctx, "failed to fetch alerts", "error", realErr)
 		return 0, 0, false
@@ -413,9 +421,11 @@ func (p *Poller) pollAlerts(ctx context.Context) (count, skippedUnparseable int,
 	// (REVIEW AMENDMENT, 2026-07-08 Tier 1 plan).
 	count, skipped, degraded, err := p.cfg.Store.UpsertAlertsBatch(ctx, alerts.Features)
 	if err != nil {
+		p.lastAlertsUpsertFailed = true
 		slog.ErrorContext(ctx, "failed to batch-upsert alerts", "error", err)
 		return count, skipped, false
 	}
+	p.lastAlertsUpsertFailed = false
 	if degraded {
 		slog.WarnContext(ctx, "alerts upserted via fallback path",
 			"count", count,
