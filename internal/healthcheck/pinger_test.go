@@ -2,8 +2,10 @@ package healthcheck
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -105,4 +107,50 @@ func TestPingAsync_NetworkErrorDoesNotPanic(t *testing.T) {
 	}()
 	p.PingAsync(context.Background())
 	time.Sleep(50 * time.Millisecond) // let the background goroutine run
+}
+
+func TestPing_DrainsResponseBodyForKeepAliveReuse(t *testing.T) {
+	t.Parallel()
+
+	var (
+		newConns int32
+		mu       sync.Mutex
+		hits     []string
+	)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits = append(hits, r.RemoteAddr)
+		mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			atomic.AddInt32(&newConns, 1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	p := New(srv.URL)
+	client := srv.Client()
+	p.Client = client
+	defer client.CloseIdleConnections()
+
+	p.ping(context.Background())
+	p.ping(context.Background())
+
+	if got := atomic.LoadInt32(&newConns); got != 1 {
+		t.Fatalf("expected keep-alive connection reuse after draining body; got %d new connections", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(hits) != 2 {
+		t.Fatalf("expected 2 pings, got %d", len(hits))
+	}
+	if hits[0] != hits[1] {
+		t.Fatalf("expected both pings on the same remote address, got %q then %q", hits[0], hits[1])
+	}
 }

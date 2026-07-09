@@ -19,6 +19,7 @@ package healthcheck
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -103,7 +104,10 @@ func (p *Pinger) ping(parent context.Context) {
 		slog.WarnContext(parent, "healthcheck ping failed", "error", err)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode >= 300 {
 		slog.WarnContext(parent, "healthcheck ping non-2xx response", "status", resp.StatusCode)
