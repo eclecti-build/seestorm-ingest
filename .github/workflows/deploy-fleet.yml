@@ -1,18 +1,10 @@
-name: Deploy Fleet (stub)
+name: Deploy Fleet
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STUB — fleet deploy is NOT automated yet.
-#
-# The CI auto-deploy (deploy.yml) ships ONLY the publisher (seestorm-ingest).
-# The 7 region ingesters are deployed manually with `make deploy-fleet`.
-#
-# This placeholder is intentionally inert: it is manual-only (workflow_dispatch),
-# never auto-runs, and does NOT deploy anything. It exists so the automation has a
-# home and a paper trail. Before turning it into a real deploy, resolve the two
-# prerequisites in docs/fleet-deploy-automation.md (org-scoped FLY_API_TOKEN +
-# the auth-precheck), then replace the `remind` job with the matrix sketched in
-# that doc.
-# ─────────────────────────────────────────────────────────────────────────────
+# PHASE A — dry-run / token-scope check. Manual-only, deploys NOTHING.
+# Validates that FLY_API_TOKEN can reach all 8 fleet apps before this
+# workflow is flipped to real, auto-triggered deploys (Phase D). See
+# docs/fleet-deploy-automation.md and
+# docs/superpowers/plans/2026-07-08-tier3-infra-maturity.md Task 2.
 
 on:
   workflow_dispatch:
@@ -20,14 +12,29 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: fly-deploy-fleet-main
+  cancel-in-progress: false
+
 jobs:
-  remind:
-    name: Fleet deploy is not automated yet
+  check-token-scope:
+    name: Verify token reaches ${{ matrix.app }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+          - seestorm-ingest
+          - seestorm-ingest-dixie
+          - seestorm-ingest-gulf
+          - seestorm-ingest-midwest
+          - seestorm-ingest-mountain
+          - seestorm-ingest-northeast
+          - seestorm-ingest-pacific
+          - seestorm-ingest-plains
     steps:
-      - name: Explain (no deploy happens here)
-        run: |
-          echo "::warning title=Fleet deploy not automated::This workflow is a stub and does not deploy."
-          echo "The CI auto-deploy ships ONLY the publisher (seestorm-ingest)."
-          echo "To roll a change to all 8 apps, run locally:  make deploy-fleet"
-          echo "Automation plan + prerequisites: docs/fleet-deploy-automation.md"
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+      - name: flyctl status (read-only — proves auth reaches this app)
+        run: flyctl status -a ${{ matrix.app }}
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
