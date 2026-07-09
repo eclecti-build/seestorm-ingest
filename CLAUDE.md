@@ -57,16 +57,12 @@ and collapses the client's history window (the 2026-05 incident).
 
 `.github/workflows/deploy.yml` auto-deploys **only `seestorm-ingest`** (the
 publisher) — gated on CI: it runs after the CI workflow succeeds on `main`
-(`workflow_run`). Ship the rest with `make deploy-fleet` (pushes the current image
-to all 8; role/region come from each app's secrets). `make deploy-fleet-check`
-lists the roster and each app's current image.
-
-> ⚠️ **If your change touches the ingesters** — anything under `internal/poller`,
-> `internal/store`, `internal/nws`, or `internal/spc` (polling, upsert,
-> retire/purge, parsing) — the CI auto-deploy ships it to the **publisher only**.
-> It is **NOT live on the 7 region ingesters** until you run `make deploy-fleet`.
-> Skipping this leaves the fleet on mixed image versions. Fleet-deploy automation
-> is stubbed but not yet wired — see `docs/fleet-deploy-automation.md`.
+(`workflow_run`). `.github/workflows/deploy-fleet.yml` auto-deploys the **7
+regional ingesters** on the same successful CI-on-`main` gate. `make
+deploy-fleet` remains a manual fallback for all 8 apps (pushes the current image;
+role/region come from each app's secrets), but do not run it while a CI-triggered
+deploy is in flight. `make deploy-fleet-check` lists the roster and each app's
+current image.
 
 ## Health monitoring
 
