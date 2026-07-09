@@ -53,8 +53,9 @@ type Config struct {
 type Poller struct {
 	cfg Config
 	// lastAlertsUpsertFailed tracks whether the most recent 200-path
-	// alerts upsert failed after NWS had already advanced its cached ETag.
-	// poll() runs single-threaded, so this cross-cycle state needs no lock.
+	// alerts upsert failed after the NWS client decoded the payload and
+	// retained its cached ETag. poll() runs single-threaded, so this
+	// cross-cycle state needs no lock.
 	lastAlertsUpsertFailed bool
 }
 
