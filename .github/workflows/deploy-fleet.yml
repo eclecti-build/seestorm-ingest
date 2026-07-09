@@ -64,8 +64,8 @@ jobs:
   verify-fleet-converged:
     name: Drift check (7 regionals — publisher is deploy.yml's responsibility)
     needs: deploy
-    # Drift check must run on partial deploy failure; that is the scenario that creates drift.
-    if: ${{ !cancelled() }}
+    # Drift check runs on full or partial deploy outcomes, but not when deploy was skipped (CI-failed trigger).
+    if: ${{ !cancelled() && needs.deploy.result != 'skipped' }}
     runs-on: ubuntu-latest
     steps:
       - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
