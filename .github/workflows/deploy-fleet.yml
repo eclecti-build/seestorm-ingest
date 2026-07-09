@@ -1,33 +1,125 @@
-name: Deploy Fleet (stub)
+name: Deploy Fleet
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STUB — fleet deploy is NOT automated yet.
+# Ships the 7 region ingesters on every merge to main, gated on CI success
+# exactly like deploy.yml. Supersedes human-triggered `make deploy-fleet`
+# as the default path for the regionals; the make target remains as a
+# documented fallback (hotfix between merges, or if this workflow itself
+# is broken). See docs/fleet-deploy-automation.md.
 #
-# The CI auto-deploy (deploy.yml) ships ONLY the publisher (seestorm-ingest).
-# The 7 region ingesters are deployed manually with `make deploy-fleet`.
-#
-# This placeholder is intentionally inert: it is manual-only (workflow_dispatch),
-# never auto-runs, and does NOT deploy anything. It exists so the automation has a
-# home and a paper trail. Before turning it into a real deploy, resolve the two
-# prerequisites in docs/fleet-deploy-automation.md (org-scoped FLY_API_TOKEN +
-# the auth-precheck), then replace the `remind` job with the matrix sketched in
-# that doc.
-# ─────────────────────────────────────────────────────────────────────────────
+# seestorm-ingest (the publisher) is DELIBERATELY EXCLUDED from the matrix
+# below. deploy.yml already auto-deploys it on this exact same
+# workflow_run trigger; including it here too would race two concurrent
+# `flyctl deploy -a seestorm-ingest` calls against each other (this
+# workflow's `fly-deploy-fleet-main` concurrency group does not serialize
+# against deploy.yml's separate `fly-deploy-main` group). deploy.yml stays
+# the publisher's one and only auto-deployer.
 
 on:
-  workflow_dispatch:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
 
+concurrency:
+  group: fly-deploy-fleet-main
+  cancel-in-progress: false
+
 jobs:
-  remind:
-    name: Fleet deploy is not automated yet
+  deploy:
+    name: Deploy ${{ matrix.app }}
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event.workflow_run.conclusion == 'success' &&
+           github.event.workflow_run.head_branch == 'main') }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+          # seestorm-ingest (publisher) intentionally NOT listed — see the
+          # comment block above this workflow's `name:`. deploy.yml is its
+          # sole deployer.
+          - seestorm-ingest-dixie
+          - seestorm-ingest-gulf
+          - seestorm-ingest-midwest
+          - seestorm-ingest-mountain
+          - seestorm-ingest-northeast
+          - seestorm-ingest-pacific
+          - seestorm-ingest-plains
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+      - name: Deploy ${{ matrix.app }}
+        run: flyctl deploy -a ${{ matrix.app }} -c fly.toml --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  verify-fleet-converged:
+    name: Drift check (7 regionals — publisher is deploy.yml's responsibility)
+    needs: deploy
+    # Drift check runs on full or partial deploy outcomes, but not when deploy was skipped (CI-failed trigger).
+    if: ${{ !cancelled() && needs.deploy.result != 'skipped' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Explain (no deploy happens here)
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+      - name: Check deployed image digests (regionals only)
         run: |
-          echo "::warning title=Fleet deploy not automated::This workflow is a stub and does not deploy."
-          echo "The CI auto-deploy ships ONLY the publisher (seestorm-ingest)."
-          echo "To roll a change to all 8 apps, run locally:  make deploy-fleet"
-          echo "Automation plan + prerequisites: docs/fleet-deploy-automation.md"
+          apps=(
+            seestorm-ingest-dixie
+            seestorm-ingest-gulf
+            seestorm-ingest-midwest
+            seestorm-ingest-mountain
+            seestorm-ingest-northeast
+            seestorm-ingest-pacific
+            seestorm-ingest-plains
+          )
+
+          per_app_listing="$(mktemp)"
+          all_digests="$(mktemp)"
+
+          for app in "${apps[@]}"; do
+            digests="$(
+              flyctl image show -a "$app" --json |
+                jq -r '.[].Digest // empty' |
+                sort -u
+            )"
+
+            if [ -z "$digests" ]; then
+              echo "::error::No deployed image digest found for ${app}"
+              cat "$per_app_listing"
+              exit 1
+            fi
+
+            while IFS= read -r digest; do
+              [ -n "$digest" ] || continue
+              echo "${app} ${digest}" | tee -a "$per_app_listing"
+              echo "$digest" >> "$all_digests"
+            done <<< "$digests"
+          done
+
+          unique_digests="$(sort -u "$all_digests")"
+          digest_count="$(printf '%s\n' "$unique_digests" | grep -c .)"
+
+          # Exclude seestorm-ingest here: it is deploy.yml's sole
+          # responsibility and may legitimately be mid-deploy or briefly on a
+          # different image at the instant this job runs, independent of THIS
+          # workflow's own 7-app matrix. Checking it here would produce a
+          # false-positive drift failure driven by a harmless cross-workflow
+          # timing race, not a real fleet-convergence bug.
+          if [ "$digest_count" -ne 1 ]; then
+            echo "::error::Regional fleet image drift detected — the 7 regionals are NOT on the same image digest:"
+            cat "$per_app_listing"
+            exit 1
+          fi
+
+          echo "All 7 regionals converged on image digest: ${unique_digests}"
+          echo "(seestorm-ingest/publisher excluded from this check by design — see deploy.yml)"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

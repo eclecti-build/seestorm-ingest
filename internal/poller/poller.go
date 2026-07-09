@@ -14,6 +14,7 @@ import (
 
 	"github.com/eclecti-build/seestorm-ingest/internal/config"
 	"github.com/eclecti-build/seestorm-ingest/internal/health"
+	"github.com/eclecti-build/seestorm-ingest/internal/healthcheck"
 	"github.com/eclecti-build/seestorm-ingest/internal/nws"
 	"github.com/eclecti-build/seestorm-ingest/internal/publisher"
 	"github.com/eclecti-build/seestorm-ingest/internal/spc"
@@ -37,6 +38,11 @@ type Config struct {
 	// to leave nil (health.Registry's methods are nil-receiver-safe) —
 	// existing/future unit tests that build a bare Config don't need it.
 	Health *health.Registry
+	// HealthPing sends an end-of-cycle heartbeat to an external dead-man's-
+	// switch (healthchecks.io), GATED by shouldHeartbeat. Nil, or a Pinger
+	// with an empty URL, is a valid no-op — safe for local dev and any
+	// Config built without it.
+	HealthPing *healthcheck.Pinger
 	// jitterFunc overrides startup-jitter delay computation for tests.
 	// nil in production, which uses startupJitter's real math/rand/v2
 	// implementation. Unexported: only this package's own tests can set
@@ -46,6 +52,11 @@ type Config struct {
 
 type Poller struct {
 	cfg Config
+	// lastAlertsUpsertFailed tracks whether the most recent 200-path
+	// alerts upsert failed after the NWS client decoded the payload and
+	// retained its cached ETag. poll() runs single-threaded, so this
+	// cross-cycle state needs no lock.
+	lastAlertsUpsertFailed bool
 }
 
 func New(cfg Config) *Poller {
@@ -297,6 +308,10 @@ func (p *Poller) poll(pollCtx context.Context) {
 	fetchStoreBudget, publishBudget := splitCycleBudget(cycleTimeout)
 
 	var alertCount, reportCount, alertsSkippedUnparseable int
+	// Both default to true: a phase this Mode doesn't run at all is
+	// vacuously fine for heartbeat-gating purposes (see shouldHeartbeat).
+	alertsOK := true
+	mergedPublishOK := true
 
 	// Fetch+store phase (ingest + both modes): bounded so a slow NWS/SPC can't
 	// consume the whole cycle budget. When this context expires, in-flight
@@ -304,7 +319,7 @@ func (p *Poller) poll(pollCtx context.Context) {
 	// own fresh budget. Publish-only nodes skip this entirely.
 	if p.cfg.Mode.ShouldIngest() {
 		fetchStoreCtx, fetchStoreCancel := context.WithTimeout(pollCtx, fetchStoreBudget)
-		alertCount, alertsSkippedUnparseable = p.pollAlerts(fetchStoreCtx)
+		alertCount, alertsSkippedUnparseable, alertsOK = p.pollAlerts(fetchStoreCtx)
 		reportCount = p.pollStormReports(fetchStoreCtx)
 		// PR2: drop expired dead rows so the table stops growing unboundedly.
 		// Runs only on ingest-role nodes (writers); idempotent across the fleet.
@@ -324,7 +339,7 @@ func (p *Poller) poll(pollCtx context.Context) {
 	// merged + history snapshot.
 	if p.cfg.Mode.ShouldPublish() {
 		publishCtx, publishCancel := context.WithTimeout(pollCtx, publishBudget)
-		p.publishSnapshot(publishCtx)
+		mergedPublishOK = p.publishSnapshot(publishCtx)
 		publishCancel()
 	}
 
@@ -338,6 +353,19 @@ func (p *Poller) poll(pollCtx context.Context) {
 		"fetch_store_budget", fetchStoreBudget,
 		"publish_budget", publishBudget,
 	)
+
+	// Dead-man's-switch heartbeat (Tier 3 #1), GATED by shouldHeartbeat: a
+	// heartbeat alone proves "poll() reached the end of the function," not
+	// "the mode-relevant work this node exists to do actually succeeded."
+	// Pinging unconditionally would keep healthchecks.io green even if every
+	// cycle's alerts fetch (or merged publish) were failing while the
+	// process stayed up and looped — exactly the "process alive,
+	// accomplishing nothing" incident class this task's goal statement
+	// names. nil-safe: a Config built without HealthPing (e.g. in a future
+	// test harness) is unaffected.
+	if p.cfg.HealthPing != nil && shouldHeartbeat(p.cfg.Mode, alertsOK, mergedPublishOK) {
+		p.cfg.HealthPing.PingAsync(pollCtx)
+	}
 }
 
 // classifyAlertFetchErr distinguishes "unchanged" (304 via
@@ -352,7 +380,11 @@ func classifyAlertFetchErr(err error) (unchanged bool, realErr error) {
 	return false, err
 }
 
-func (p *Poller) pollAlerts(ctx context.Context) (count int, skippedUnparseable int) {
+func etagVouchesForStore(lastUpsertFailed bool) bool {
+	return !lastUpsertFailed
+}
+
+func (p *Poller) pollAlerts(ctx context.Context) (count, skippedUnparseable int, ok bool) {
 	// Cap the alerts fetch (including any internal/retry retries) at
 	// AlertsFetchBudgetPercent of whatever fetch+store budget remains
 	// right now. Alerts fetches first among this phase's upstream calls
@@ -366,16 +398,16 @@ func (p *Poller) pollAlerts(ctx context.Context) (count int, skippedUnparseable 
 	fetchCancel()
 	if unchanged, realErr := classifyAlertFetchErr(err); unchanged {
 		// 304 Not Modified: upstream confirmed nothing changed. Still a
-		// successful fetch for health purposes — skip decode + upsert.
-		// Observable effect: this cycle's "poll cycle complete" log reads
-		// alerts_processed=0, indistinguishable from zero active alerts.
-		// On-call should treat repeated 0s with no fetch errors as healthy
-		// steady-state, not stopped ingestion.
+		// successful fetch for /healthz purposes — skip decode + upsert.
+		// For the dead-man's-switch heartbeat, the ETag only vouches for
+		// data already landed in the store; if the last 200-path upsert
+		// failed, keep withholding the heartbeat until a future 200 payload
+		// upserts successfully.
 		p.cfg.Health.RecordSuccess(health.FeedAlerts, time.Now())
-		return 0, 0
+		return 0, 0, etagVouchesForStore(p.lastAlertsUpsertFailed)
 	} else if realErr != nil {
 		slog.ErrorContext(ctx, "failed to fetch alerts", "error", realErr)
-		return 0, 0
+		return 0, 0, false
 	}
 	p.cfg.Health.RecordSuccess(health.FeedAlerts, time.Now())
 
@@ -390,9 +422,11 @@ func (p *Poller) pollAlerts(ctx context.Context) (count int, skippedUnparseable 
 	// (REVIEW AMENDMENT, 2026-07-08 Tier 1 plan).
 	count, skipped, degraded, err := p.cfg.Store.UpsertAlertsBatch(ctx, alerts.Features)
 	if err != nil {
+		p.lastAlertsUpsertFailed = true
 		slog.ErrorContext(ctx, "failed to batch-upsert alerts", "error", err)
-		return count, skipped
+		return count, skipped, false
 	}
+	p.lastAlertsUpsertFailed = false
 	if degraded {
 		slog.WarnContext(ctx, "alerts upserted via fallback path",
 			"count", count,
@@ -400,7 +434,7 @@ func (p *Poller) pollAlerts(ctx context.Context) (count int, skippedUnparseable 
 		)
 	}
 
-	return count, skipped
+	return count, skipped, true
 }
 
 func (p *Poller) pollStormReports(ctx context.Context) int {
@@ -461,11 +495,11 @@ const publishPutTimeout = time.Duration(config.PerPublishPutTimeoutSec) * time.S
 // for why this is fixed rather than jittered/exponential.
 const publishRetryDelay = time.Duration(config.PublishPutRetryDelayMs) * time.Millisecond
 
-func (p *Poller) publishSnapshot(ctx context.Context) {
+func (p *Poller) publishSnapshot(ctx context.Context) (mergedOK bool) {
 	alerts, err := p.cfg.Store.GetActiveAlerts(ctx)
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to get active alerts for snapshot", "error", err)
-		return
+		return false
 	}
 
 	// Build the merged snapshot first so the per-state siblings can reuse
@@ -480,13 +514,15 @@ func (p *Poller) publishSnapshot(ctx context.Context) {
 
 	// Merged snapshot — the back-compat path and the "view all" UX. Goes
 	// through the publisher's history archival as well.
-	if p.publishWithRetry(ctx, "merged", "", func(timeoutCtx context.Context) error {
+	mergedOK = p.publishWithRetry(ctx, "merged", "", func(timeoutCtx context.Context) error {
 		return p.cfg.Publisher.Publish(timeoutCtx, snapshot)
-	}) {
+	})
+	if mergedOK {
 		p.cfg.Health.RecordSuccess(health.FeedPublish, time.Now())
 	}
 
 	p.publishPerStateSnapshots(ctx, alerts, snapshot.GeneratedAt)
+	return mergedOK
 }
 
 // publishPerStateSnapshots fans the per-state R2 writes out with bounded

@@ -57,16 +57,49 @@ and collapses the client's history window (the 2026-05 incident).
 
 `.github/workflows/deploy.yml` auto-deploys **only `seestorm-ingest`** (the
 publisher) — gated on CI: it runs after the CI workflow succeeds on `main`
-(`workflow_run`). Ship the rest with `make deploy-fleet` (pushes the current image
-to all 8; role/region come from each app's secrets). `make deploy-fleet-check`
-lists the roster and each app's current image.
+(`workflow_run`). `.github/workflows/deploy-fleet.yml` auto-deploys the **7
+regional ingesters** on the same successful CI-on-`main` gate. `make
+deploy-fleet` remains a manual fallback for all 8 apps (pushes the current image;
+role/region come from each app's secrets), but do not run it while a CI-triggered
+deploy is in flight. `make deploy-fleet-check` lists the roster and each app's
+current image.
 
-> ⚠️ **If your change touches the ingesters** — anything under `internal/poller`,
-> `internal/store`, `internal/nws`, or `internal/spc` (polling, upsert,
-> retire/purge, parsing) — the CI auto-deploy ships it to the **publisher only**.
-> It is **NOT live on the 7 region ingesters** until you run `make deploy-fleet`.
-> Skipping this leaves the fleet on mixed image versions. Fleet-deploy automation
-> is stubbed but not yet wired — see `docs/fleet-deploy-automation.md`.
+## Health monitoring
+
+Each of the 8 Fly apps pings a per-app healthchecks.io check
+(`HEALTHCHECK_PING_URL` Fly secret) at the end of every poll cycle
+(~30s) WHOSE MODE-RELEVANT WORK SUCCEEDED — for the 7 regional
+ingesters (`MODE=ingest`), that means the NWS alerts fetch + DB upsert
+succeeded (an SPC/storm-report failure alone does not block the ping);
+for the publisher (`MODE=publish`, or the default `MODE=both` in local
+dev), that means the merged-snapshot publish to R2 succeeded. See
+`shouldHeartbeat` in `internal/poller/heartbeat.go` for the exact
+gating — this is deliberately NOT "the loop completed an iteration,"
+which would keep the check green even if the safety-critical feed had
+been failing every cycle while the process stayed up.
+
+healthchecks.io alerts by email after a check misses its Period (60s) +
+Grace (60s) window, i.e. ~2 minutes — at the real ~30s ping cadence
+that's **~4 consecutive missed/failed cycles, not 2**.
+
+**Per-app triage meaning** (read this first — it's what actually paged
+you):
+- A **regional** check firing (`seestorm-ingest-<region>`) means that
+  region's alert data is going stale in the shared database while
+  everything else looks fine — other regions and the publisher are
+  unaffected. Urgent, but scoped: check that one Fly app's logs first.
+- The **publisher** check firing (`seestorm-ingest`, `MODE=publish`)
+  means NO fresh data is reaching ANY client nationwide — this is
+  page-worthy immediately, not "look into it during business hours."
+
+This is the ONLY external alerting SeeStorm has today; it detects "the
+mode-relevant work this node exists to do stopped succeeding" (process
+death, hang, crash, or a persistent upstream/DB failure), not per-cycle
+correctness for every sub-step (already covered by existing slog error
+lines — e.g. a single transient NWS 503 that the next cycle recovers
+from does not, by itself, miss enough consecutive pings to alert). See
+`internal/healthcheck/pinger.go`, `internal/poller/heartbeat.go`, and
+`docs/superpowers/plans/2026-07-08-tier3-infra-maturity.md` Task 1.
 
 ## Auth
 **None.** The ingest service exposes no authenticated endpoints today — its output (snapshot JSON on Cloudflare R2) is public by design. Public safety data stays frictionless.

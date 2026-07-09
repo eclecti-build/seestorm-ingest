@@ -109,12 +109,17 @@ func (c *Client) FetchActiveAlerts(ctx context.Context, area string) (*AlertsRes
 			continue
 		}
 
-		// 200 OK: capture the new ETag (if present) BEFORE decoding, so a
-		// decode failure still leaves us positioned to send a conditional
-		// request next cycle — a transient decode issue is not a reason to
-		// lose the freshness signal.
-		if newETag := resp.Header.Get("ETag"); newETag != "" {
+		// 200 OK: capture the new ETag before decoding, but roll it back if
+		// decoding fails. If an ETag from a not-even-decoded payload survived,
+		// a later 304 could vouch for data that never reached the store; the
+		// poller's lastAlertsUpsertFailed covers decoded-but-not-stored, while
+		// this rollback covers not-even-decoded.
+		newETag := resp.Header.Get("ETag")
+		previousETag := ""
+		hadPreviousETag := false
+		if newETag != "" {
 			c.etagMu.Lock()
+			previousETag, hadPreviousETag = c.etags[endpoint]
 			c.etags[endpoint] = newETag
 			c.etagMu.Unlock()
 		}
@@ -129,6 +134,15 @@ func (c *Client) FetchActiveAlerts(ctx context.Context, area string) (*AlertsRes
 		decodeErr := json.NewDecoder(limited).Decode(&alerts)
 		_ = resp.Body.Close()
 		if decodeErr != nil {
+			if newETag != "" {
+				c.etagMu.Lock()
+				if hadPreviousETag {
+					c.etags[endpoint] = previousETag
+				} else {
+					delete(c.etags, endpoint)
+				}
+				c.etagMu.Unlock()
+			}
 			return nil, fmt.Errorf("decoding alerts: %w", decodeErr)
 		}
 		return &alerts, nil

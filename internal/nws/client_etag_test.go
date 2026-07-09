@@ -100,3 +100,44 @@ func TestFetchActiveAlerts_NoETagMeansNoConditionalRequestSent(t *testing.T) {
 		t.Fatalf("expected no If-None-Match header (no prior ETag), got %q", sawIfNoneMatch)
 	}
 }
+
+func TestFetchActiveAlerts_DoesNotReuseETagFromMalformedResponse(t *testing.T) {
+	t.Parallel()
+	var sawIfNoneMatch string
+	call := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call++
+		switch call {
+		case 1:
+			w.Header().Set("ETag", `"malformed"`)
+			w.Header().Set("Content-Type", "application/geo+json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{`))
+		default:
+			sawIfNoneMatch = r.Header.Get("If-None-Match")
+			w.Header().Set("ETag", `"clean"`)
+			w.Header().Set("Content-Type", "application/geo+json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"type":"FeatureCollection","features":[]}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := NewClient("test-agent")
+	c.baseURL = srv.URL
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := c.FetchActiveAlerts(ctx, "WI"); err == nil {
+		t.Fatal("first fetch: expected decode error from malformed body, got nil")
+	}
+	if _, err := c.FetchActiveAlerts(ctx, "WI"); err != nil {
+		t.Fatalf("second fetch: %v", err)
+	}
+	if sawIfNoneMatch == `"malformed"` {
+		t.Fatalf("expected malformed response ETag not to be reused, got If-None-Match %q", sawIfNoneMatch)
+	}
+	if sawIfNoneMatch != "" {
+		t.Fatalf("expected no If-None-Match header after malformed first response, got %q", sawIfNoneMatch)
+	}
+}
