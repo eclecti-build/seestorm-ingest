@@ -15,6 +15,7 @@ import (
 
 	"github.com/eclecti-build/seestorm-ingest/internal/config"
 	"github.com/eclecti-build/seestorm-ingest/internal/health"
+	"github.com/eclecti-build/seestorm-ingest/internal/healthcheck"
 	"github.com/eclecti-build/seestorm-ingest/internal/nws"
 	"github.com/eclecti-build/seestorm-ingest/internal/poller"
 	"github.com/eclecti-build/seestorm-ingest/internal/publisher"
@@ -69,6 +70,10 @@ func run() error {
 			pollInterval = d
 		}
 	}
+
+	// HEALTHCHECK_PING_URL is unset by default (local dev): healthcheck.New("")
+	// returns a no-op Pinger, so this line never needs an env-presence branch.
+	healthPingURL := os.Getenv("HEALTHCHECK_PING_URL")
 
 	// MODE splits the fleet into region-scoped ingesters and a single snapshot
 	// publisher. Unset defaults to "both" (poll + publish), preserving the
@@ -138,6 +143,7 @@ func run() error {
 		Areas:        areas,
 		Mode:         mode,
 		Health:       healthReg,
+		HealthPing:   healthcheck.New(healthPingURL),
 	})
 
 	maxAge := time.Duration(health.StalenessMultiplier) * pollInterval
@@ -166,6 +172,7 @@ func run() error {
 		"areas", areas,
 		"user_agent", nwsUserAgent,
 		"publishers", len(publishers),
+		"healthcheck_ping_configured", healthPingURL != "",
 	)
 
 	if err := p.Run(ctx); err != nil {

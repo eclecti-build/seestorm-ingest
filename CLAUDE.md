@@ -68,6 +68,43 @@ lists the roster and each app's current image.
 > Skipping this leaves the fleet on mixed image versions. Fleet-deploy automation
 > is stubbed but not yet wired — see `docs/fleet-deploy-automation.md`.
 
+## Health monitoring
+
+Each of the 8 Fly apps pings a per-app healthchecks.io check
+(`HEALTHCHECK_PING_URL` Fly secret) at the end of every poll cycle
+(~30s) WHOSE MODE-RELEVANT WORK SUCCEEDED — for the 7 regional
+ingesters (`MODE=ingest`), that means the NWS alerts fetch + DB upsert
+succeeded (an SPC/storm-report failure alone does not block the ping);
+for the publisher (`MODE=publish`, or the default `MODE=both` in local
+dev), that means the merged-snapshot publish to R2 succeeded. See
+`shouldHeartbeat` in `internal/poller/heartbeat.go` for the exact
+gating — this is deliberately NOT "the loop completed an iteration,"
+which would keep the check green even if the safety-critical feed had
+been failing every cycle while the process stayed up.
+
+healthchecks.io alerts by email after a check misses its Period (60s) +
+Grace (60s) window, i.e. ~2 minutes — at the real ~30s ping cadence
+that's **~4 consecutive missed/failed cycles, not 2**.
+
+**Per-app triage meaning** (read this first — it's what actually paged
+you):
+- A **regional** check firing (`seestorm-ingest-<region>`) means that
+  region's alert data is going stale in the shared database while
+  everything else looks fine — other regions and the publisher are
+  unaffected. Urgent, but scoped: check that one Fly app's logs first.
+- The **publisher** check firing (`seestorm-ingest`, `MODE=publish`)
+  means NO fresh data is reaching ANY client nationwide — this is
+  page-worthy immediately, not "look into it during business hours."
+
+This is the ONLY external alerting SeeStorm has today; it detects "the
+mode-relevant work this node exists to do stopped succeeding" (process
+death, hang, crash, or a persistent upstream/DB failure), not per-cycle
+correctness for every sub-step (already covered by existing slog error
+lines — e.g. a single transient NWS 503 that the next cycle recovers
+from does not, by itself, miss enough consecutive pings to alert). See
+`internal/healthcheck/pinger.go`, `internal/poller/heartbeat.go`, and
+`docs/superpowers/plans/2026-07-08-tier3-infra-maturity.md` Task 1.
+
 ## Auth
 **None.** The ingest service exposes no authenticated endpoints today — its output (snapshot JSON on Cloudflare R2) is public by design. Public safety data stays frictionless.
 
