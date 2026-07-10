@@ -21,10 +21,38 @@ import (
 	"github.com/eclecti-build/seestorm-ingest/internal/store"
 )
 
+// AlertFetcher is the poller's view of the NWS alerts client. Satisfied by
+// *nws.Client; narrowed to an interface so poll()-level orchestration
+// (budget splits, ETag-vouching heartbeat gating, cross-cycle upsert state)
+// is testable with fakes — the seam filed as a follow-up in PR #66.
+type AlertFetcher interface {
+	FetchActiveAlerts(ctx context.Context, area string) (*nws.AlertsResponse, error)
+}
+
+// ReportFetcher is the poller's view of the SPC storm-report client.
+// Satisfied by *spc.Client.
+type ReportFetcher interface {
+	FetchTodayTornadoReports(ctx context.Context) ([]spc.StormReport, error)
+	FetchTodayHailReports(ctx context.Context) ([]spc.StormReport, error)
+	FetchTodayWindReports(ctx context.Context) ([]spc.StormReport, error)
+}
+
+// AlertStore is the poller's view of the PostGIS store — exactly the four
+// methods poll() calls, nothing more. Satisfied by *store.Store. Store
+// BEHAVIOR tests stay on real Postgres per this repo's no-DB-mocks
+// convention; this interface exists to fake the store when testing the
+// POLLER's orchestration.
+type AlertStore interface {
+	UpsertAlertsBatch(ctx context.Context, alerts []nws.Alert) (count, skipped int, degraded bool, err error)
+	UpsertStormReportsBatch(ctx context.Context, reports []spc.StormReport) (count int, degraded bool, err error)
+	GetActiveAlerts(ctx context.Context) ([]store.ActiveAlertGeoJSON, error)
+	PurgeExpired(ctx context.Context) (int64, error)
+}
+
 type Config struct {
-	NWS          *nws.Client
-	SPC          *spc.Client
-	Store        *store.Store
+	NWS          AlertFetcher
+	SPC          ReportFetcher
+	Store        AlertStore
 	Publisher    publisher.Publisher
 	PollInterval time.Duration
 	// Areas is the set of US state codes to poll. The NWS API accepts a
@@ -371,8 +399,9 @@ func (p *Poller) poll(pollCtx context.Context) {
 // classifyAlertFetchErr distinguishes "unchanged" (304 via
 // nws.ErrNotModified) from a real failure. Pure function so it — and
 // therefore the branching behavior pollAlerts relies on — is unit
-// testable without a live *nws.Client (NWS is a concrete field on
-// Config, not an interface; see this plan's "Corrections" section).
+// testable without a live *nws.Client (kept as a pure function even now
+// that Config.NWS is the AlertFetcher interface — the classification branch
+// is meaningful on its own).
 func classifyAlertFetchErr(err error) (unchanged bool, realErr error) {
 	if errors.Is(err, nws.ErrNotModified) {
 		return true, nil

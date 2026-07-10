@@ -70,13 +70,10 @@ func TestWithBudgetFraction_AlreadyExpiredParentYieldsExpiredChild(t *testing.T)
 //
 // This targets the composition seam (withBudgetFraction applied in the
 // same sequence pollAlerts/pollStormReports use) rather than the real
-// pollAlerts/pollStormReports methods directly: NWS/SPC/Store are
-// concrete types with no interface seam (see this plan's "Corrections"
-// section), so a live end-to-end version would need a real Postgres
-// connection AND a way to override *nws.Client/*spc.Client's unexported
-// baseURL from outside their own packages, neither of which this
-// already-large plan introduces. The pure-composition test below proves
-// the SAME arithmetic pollAlerts/pollStormReports execute.
+// pollAlerts/pollStormReports methods directly. Although Config now exposes
+// collaborator interfaces for poll()-level fakes, the pure-composition test
+// below directly proves the SAME arithmetic pollAlerts/pollStormReports
+// execute without coupling this budget invariant to other orchestration.
 func TestSequentialBudgetCapping_LeavesFloorForStore(t *testing.T) {
 	t.Parallel()
 	const fetchStoreBudget = 2 * time.Second
