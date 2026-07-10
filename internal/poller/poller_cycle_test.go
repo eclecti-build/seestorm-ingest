@@ -56,7 +56,6 @@ func (f *fakeReportFetcher) FetchTodayWindReports(_ context.Context) ([]spc.Stor
 }
 
 type fakeStore struct {
-	upsertAlertsErr    error
 	upsertAlertsScript []error
 	gotAlerts          [][]nws.Alert
 	gotReports         [][]spc.StormReport
@@ -69,7 +68,7 @@ func (s *fakeStore) UpsertAlertsBatch(_ context.Context, alerts []nws.Alert) (in
 		s.upsertAlertsScript = s.upsertAlertsScript[1:]
 		return len(alerts), 0, false, err
 	}
-	return len(alerts), 0, false, s.upsertAlertsErr
+	return len(alerts), 0, false, nil
 }
 
 func (s *fakeStore) UpsertStormReportsBatch(_ context.Context, reports []spc.StormReport) (int, bool, error) {
@@ -97,20 +96,28 @@ func pollCycleConfig(nwsFetcher AlertFetcher, spcFetcher ReportFetcher, alertSto
 	}
 }
 
-func TestPollCycle_IngestSuccess_UpsertsFetchedAlertsAndPings(t *testing.T) {
-	pinged := make(chan struct{}, 1)
-	var hits atomic.Int32
+func newPingServer(t *testing.T) (url string, pinged chan struct{}, hits *atomic.Int32) {
+	t.Helper()
+
+	pinged = make(chan struct{}, 1)
+	hits = &atomic.Int32{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits.Add(1)
 		w.WriteHeader(http.StatusOK)
 		pinged <- struct{}{}
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+
+	return srv.URL, pinged, hits
+}
+
+func TestPollCycle_IngestSuccess_UpsertsFetchedAlertsAndPings(t *testing.T) {
+	pingURL, pinged, hits := newPingServer(t)
 
 	features := []nws.Alert{{ID: "one"}, {ID: "two"}}
 	alerts := &fakeAlertFetcher{resp: &nws.AlertsResponse{Features: features}}
 	alertStore := &fakeStore{}
-	p := New(pollCycleConfig(alerts, &fakeReportFetcher{}, alertStore, healthcheck.New(srv.URL)))
+	p := New(pollCycleConfig(alerts, &fakeReportFetcher{}, alertStore, healthcheck.New(pingURL)))
 
 	p.poll(context.Background())
 
@@ -131,18 +138,11 @@ func TestPollCycle_IngestSuccess_UpsertsFetchedAlertsAndPings(t *testing.T) {
 }
 
 func TestPollCycle_AlertsFetchError_WithholdsHeartbeat(t *testing.T) {
-	pinged := make(chan struct{}, 1)
-	var hits atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hits.Add(1)
-		w.WriteHeader(http.StatusOK)
-		pinged <- struct{}{}
-	}))
-	defer srv.Close()
+	pingURL, pinged, hits := newPingServer(t)
 
 	alerts := &fakeAlertFetcher{err: errors.New("NWS unavailable")}
 	alertStore := &fakeStore{}
-	p := New(pollCycleConfig(alerts, &fakeReportFetcher{}, alertStore, healthcheck.New(srv.URL)))
+	p := New(pollCycleConfig(alerts, &fakeReportFetcher{}, alertStore, healthcheck.New(pingURL)))
 
 	p.poll(context.Background())
 
@@ -150,6 +150,8 @@ func TestPollCycle_AlertsFetchError_WithholdsHeartbeat(t *testing.T) {
 	case <-pinged:
 		t.Fatal("expected no heartbeat after alerts fetch failure")
 	case <-time.After(200 * time.Millisecond):
+		// This is a deterministic safety margin, not a race window: poll() evaluates
+		// shouldHeartbeat synchronously before it can call PingAsync, so no withheld heartbeat arrives late.
 	}
 	if len(alertStore.gotAlerts) != 0 {
 		t.Fatalf("alerts upsert calls = %d, want 0", len(alertStore.gotAlerts))
@@ -160,14 +162,7 @@ func TestPollCycle_AlertsFetchError_WithholdsHeartbeat(t *testing.T) {
 }
 
 func TestPollCycle_304AfterFailedUpsert_WithholdsHeartbeatUntilRecovery(t *testing.T) {
-	pinged := make(chan struct{}, 1)
-	var hits atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hits.Add(1)
-		w.WriteHeader(http.StatusOK)
-		pinged <- struct{}{}
-	}))
-	defer srv.Close()
+	pingURL, pinged, hits := newPingServer(t)
 
 	features := []nws.Alert{{ID: "recovering"}}
 	alerts := &fakeAlertFetcher{script: []alertFetchResult{
@@ -176,13 +171,17 @@ func TestPollCycle_304AfterFailedUpsert_WithholdsHeartbeatUntilRecovery(t *testi
 		{resp: &nws.AlertsResponse{Features: features}},
 	}}
 	alertStore := &fakeStore{upsertAlertsScript: []error{errors.New("Postgres unavailable"), nil}}
-	p := New(pollCycleConfig(alerts, &fakeReportFetcher{}, alertStore, healthcheck.New(srv.URL)))
+	p := New(pollCycleConfig(alerts, &fakeReportFetcher{}, alertStore, healthcheck.New(pingURL)))
 
+	// Drive three sequential poll() calls on one Poller: etagVouchesForStore reads
+	// cross-cycle lastAlertsUpsertFailed state, not three independent cycles.
 	p.poll(context.Background())
 	select {
 	case <-pinged:
 		t.Fatal("expected no heartbeat after failed alerts upsert")
 	case <-time.After(200 * time.Millisecond):
+		// This is a deterministic safety margin, not a race window: poll() evaluates
+		// shouldHeartbeat synchronously before it can call PingAsync, so no withheld heartbeat arrives late.
 	}
 
 	p.poll(context.Background())
@@ -190,6 +189,8 @@ func TestPollCycle_304AfterFailedUpsert_WithholdsHeartbeatUntilRecovery(t *testi
 	case <-pinged:
 		t.Fatal("expected no heartbeat for 304 following failed alerts upsert")
 	case <-time.After(200 * time.Millisecond):
+		// This is a deterministic safety margin, not a race window: poll() evaluates
+		// shouldHeartbeat synchronously before it can call PingAsync, so no withheld heartbeat arrives late.
 	}
 
 	p.poll(context.Background())
@@ -207,12 +208,7 @@ func TestPollCycle_304AfterFailedUpsert_WithholdsHeartbeatUntilRecovery(t *testi
 }
 
 func TestPollCycle_SPCSingleFeedFailure_OthersStillUpserted(t *testing.T) {
-	pinged := make(chan struct{}, 1)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		pinged <- struct{}{}
-	}))
-	defer srv.Close()
+	pingURL, pinged, _ := newPingServer(t)
 
 	hail := spc.StormReport{Type: "hail", Location: "Hail town"}
 	wind := spc.StormReport{Type: "wind", Location: "Wind town"}
@@ -223,7 +219,7 @@ func TestPollCycle_SPCSingleFeedFailure_OthersStillUpserted(t *testing.T) {
 		wind:    []spc.StormReport{wind},
 	}
 	alertStore := &fakeStore{}
-	p := New(pollCycleConfig(alerts, reports, alertStore, healthcheck.New(srv.URL)))
+	p := New(pollCycleConfig(alerts, reports, alertStore, healthcheck.New(pingURL)))
 
 	p.poll(context.Background())
 
