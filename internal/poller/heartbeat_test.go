@@ -62,9 +62,8 @@ func TestShouldHeartbeat(t *testing.T) {
 // real Postgres instance" (see this task's Step 6 Known Scope Boundary).
 // Composing the already-unit-tested shouldHeartbeat with the
 // already-unit-tested Pinger against a real HTTP receiver is the honest
-// boundary of what's testable here without a much larger refactor of
-// Config's NWS/SPC/Store fields into interfaces, which is out of scope for
-// this task.
+// boundary of what's testable here; that former scope boundary is superseded by
+// poller_cycle_test.go's full poll()-cycle tests.
 func TestHeartbeatGating_EndToEndWithRealPinger(t *testing.T) {
 	t.Parallel()
 

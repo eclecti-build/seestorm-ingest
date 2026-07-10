@@ -83,6 +83,7 @@ jobs:
 
           per_app_listing="$(mktemp)"
           all_digests="$(mktemp)"
+          trap 'rm -f "$per_app_listing" "$all_digests"' EXIT
 
           for app in "${apps[@]}"; do
             digests="$(
@@ -105,7 +106,12 @@ jobs:
           done
 
           unique_digests="$(sort -u "$all_digests")"
-          digest_count="$(printf '%s\n' "$unique_digests" | grep -c .)"
+          # awk NF + wc -l instead of `grep -c .`: grep -c exits 1 on zero
+          # matches, which under this step's bash -e -o pipefail would kill
+          # the step with no diagnostic if the per-app loop's "every app
+          # yields a digest" invariant ever broke. wc -l never fails; the
+          # -ne 1 branch below then reports drift/emptiness properly.
+          digest_count="$(printf '%s\n' "$unique_digests" | awk 'NF' | wc -l | tr -d '[:space:]')"
 
           # Exclude seestorm-ingest here: it is deploy.yml's sole
           # responsibility and may legitimately be mid-deploy or briefly on a
