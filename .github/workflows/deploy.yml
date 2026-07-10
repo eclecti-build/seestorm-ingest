@@ -28,7 +28,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # Deploy the exact commit CI validated, not whatever main HEAD is now
           # (workflow_run can lag behind a fast follow-up push).
