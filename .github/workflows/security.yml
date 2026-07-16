@@ -22,7 +22,7 @@ jobs:
       # spec resolves to whatever 1.25.x sits in the runner toolcache, which
       # broke govulncheck when go.mod moved to 1.25.11 ahead of the cache.
       # ci.yml already reads go.mod; this keeps both on one source of truth.
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with: { go-version-file: go.mod }
       - name: govulncheck (blocking)
         run: |
