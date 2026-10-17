@@ -24,9 +24,13 @@ jobs:
       # ci.yml already reads go.mod; this keeps both on one source of truth.
       - uses: actions/setup-go@v6
         with: { go-version-file: go.mod }
+      # Pinned, not @latest: golang.org/x/vuln v1.8.0+ requires go >= 1.26 and
+      # with GOTOOLCHAIN=local the install fails outright on our 1.25 toolchain
+      # ("requires go >= 1.26.0 (running go 1.25.12)"). v1.7.0 is the last
+      # release that builds on 1.25. Bump this together with the go.mod go line.
       - name: govulncheck (blocking)
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
           govulncheck ./...
       - name: trivy (report-only)
         uses: aquasecurity/trivy-action@master
